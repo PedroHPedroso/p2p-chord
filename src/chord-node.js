@@ -7,7 +7,7 @@ const { FINGER_COUNT, add, hashKey, inInterval, validateId } = require('./ring')
 const CATALOG_NAME = 'catalogo.txt';
 
 class ChordNode {
-  constructor({ id, host = '127.0.0.1', port = 5000, requestTimeout = 3000,
+  constructor({ id, host = '127.0.0.1', port = 5000, requestTimeout = 10000,
     storageDirectory } = {}) {
     this.id = validateId(id);
     this.host = String(host || '').trim();
@@ -106,9 +106,11 @@ class ChordNode {
   }
 
   async refreshFingerTable() {
-    for (const finger of this.fingers) {
-      finger.node = await this.findSuccessor(finger.start);
-    }
+    const nodes = await Promise.all(this.fingers.map((finger) =>
+      this.findSuccessor(finger.start)));
+    this.fingers.forEach((finger, index) => {
+      finger.node = nodes[index];
+    });
   }
 
   async refreshRingFingerTables(originId, hops = 0) {
@@ -117,10 +119,19 @@ class ChordNode {
     if (hops >= 32) throw new Error('Limite de nós excedido ao atualizar finger tables');
 
     await this.refreshFingerTable();
-    return this.rpc(this.successor, '/rpc/refresh-fingers', {
-      method: 'POST',
-      body: { originId: Number(originId), hops: hops + 1 }
+
+    // Cada nó responde após atualizar a própria tabela. O próximo salto ocorre
+    // fora da requisição atual para o tempo total não crescer com o anel.
+    const next = this.successor;
+    setImmediate(() => {
+      this.rpc(next, '/rpc/refresh-fingers', {
+        method: 'POST',
+        body: { originId: Number(originId), hops: hops + 1 }
+      }).catch((error) => {
+        console.error(`Não foi possível atualizar as fingers após o nó ${this.id}: ${error.message}`);
+      });
     });
+    return { ok: true };
   }
 
   async findSuccessor(rawId, hops = 0) {
@@ -247,6 +258,14 @@ class ChordNode {
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || `Erro HTTP ${response.status}`);
       return data;
+    } catch (error) {
+      if (error.name === 'AbortError') {
+        const timeout = new Error(
+          `Tempo limite ao acessar o nó ${target.id} em ${target.host}:${target.port}`);
+        timeout.code = 'ETIMEDOUT';
+        throw timeout;
+      }
+      throw error;
     } finally {
       clearTimeout(timer);
     }

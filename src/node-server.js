@@ -96,7 +96,8 @@ async function handleNodeRequest(node, request, response) {
     }
     return json(response, 404, { error: 'Rota não encontrada' });
   } catch (error) {
-    const status = error.name === 'AbortError' ? 504 : error.code === 'ENOENT' ? 404 : 400;
+    const status = error.name === 'AbortError' || error.code === 'ETIMEDOUT'
+      ? 504 : error.code === 'ENOENT' ? 404 : 400;
     return json(response, status, { error: error.message });
   }
 }

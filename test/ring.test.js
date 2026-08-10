@@ -2,7 +2,6 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-<<<<<<< HEAD
 const fs = require('node:fs/promises');
 const net = require('node:net');
 const os = require('node:os');
@@ -10,10 +9,6 @@ const path = require('node:path');
 const { add, hashKey, inInterval } = require('../src/ring');
 const { ChordNode } = require('../src/chord-node');
 const { startNodeServer } = require('../src/node-server');
-=======
-const { add, inInterval } = require('../src/ring');
-const { ChordNode } = require('../src/chord-node');
->>>>>>> 8b2078c48ec03d9accffe5aae6fe5f27d2b2a301
 
 test('aritmética circular usa ids públicos de 1 a 32', () => {
   assert.equal(add(31, 1), 32);
@@ -39,7 +34,6 @@ test('primeiro nó cria anel e preenche cinco fingers', async () => {
 test('cada nó aceita uma porta própria e rejeita portas inválidas', () => {
   assert.equal(new ChordNode({ id: 2, port: 5001 }).port, 5001);
   assert.throws(() => new ChordNode({ id: 2, port: 70000 }), /porta/);
-<<<<<<< HEAD
   assert.throws(() => new ChordNode({ id: 2, host: '0.0.0.0', port: 5001 }),
     /IP ou hostname/);
 });
@@ -114,6 +108,3 @@ async function freePort() {
     server.close((error) => error ? reject(error) : resolve()));
   return port;
 }
-=======
-});
->>>>>>> 8b2078c48ec03d9accffe5aae6fe5f27d2b2a301
