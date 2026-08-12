@@ -5,6 +5,8 @@ const path = require('node:path');
 const { FINGER_COUNT, add, hashKey, inInterval, validateId } = require('./ring');
 
 const CATALOG_NAME = 'catalogo.txt';
+const REPLICA_META_NAME = 'replicas.json'; // arquivo de metadados de replicação (reservado)
+const REPLICA_COUNT = 2; // número de sucessores diretos que receberão réplicas
 
 class ChordNode {
   constructor({ id, host = '127.0.0.1', port = 5000, requestTimeout = 10000,
@@ -24,6 +26,8 @@ class ChordNode {
     this.predecessor = null;
     this.fingers = this.buildEmptyFingerTable();
     this.joined = false;
+    // Mutex via cadeia de Promises para serializar leituras/escritas do replicas.json.
+    this._replicaMetaLock = Promise.resolve();
   }
 
   get reference() {
@@ -111,6 +115,12 @@ class ChordNode {
     this.fingers.forEach((finger, index) => {
       finger.node = nodes[index];
     });
+    // Após atualizar a Finger Table, verificar e sincronizar réplicas em background.
+    setImmediate(() => {
+      this.verifyReplicas().catch((error) => {
+        console.error(`[replicação] Erro em verifyReplicas após refreshFingerTable: ${error.message}`);
+      });
+    });
   }
 
   async refreshRingFingerTables(originId, hops = 0) {
@@ -176,11 +186,19 @@ class ChordNode {
     const owner = await this.findSuccessor(hashId);
 
     if (owner.id === this.id) {
-      await this.storeLocal(name, bytes);
+      await this.storeLocal(name, bytes, { isReplica: false, primaryNodeId: this.id, hashId });
+      // Replicar para os sucessores em background, sem bloquear a resposta ao cliente.
+      if (name !== CATALOG_NAME) {
+        setImmediate(() => {
+          this.replicateFile(name, bytes, hashId).catch((error) => {
+            console.error(`[replicação] Erro ao replicar "${name}": ${error.message}`);
+          });
+        });
+      }
     } else {
       await this.rpc(owner, '/rpc/files', {
         method: 'PUT',
-        body: { name, content: bytes.toString('base64') }
+        body: { name, content: bytes.toString('base64'), hashId }
       });
     }
 
@@ -220,10 +238,32 @@ class ChordNode {
     });
   }
 
-  async storeLocal(fileName, content) {
+  /**
+   * Grava bytes no diretório local do nó e registra metadados de replicação.
+   *
+   * @param {string} fileName - Nome do arquivo.
+   * @param {Buffer} content  - Conteúdo do arquivo.
+   * @param {{ isReplica?: boolean, primaryNodeId?: number|null, hashId?: number|null }} [opts]
+   *   `isReplica`: true indica que este é uma cópia do arquivo original.
+   *   `primaryNodeId`: id do nó que detém o arquivo primário.
+   *   `hashId`: hash/chave do arquivo no anel Chord.
+   */
+  async storeLocal(fileName, content, { isReplica = false, primaryNodeId, hashId } = {}) {
     const name = validateFileName(fileName);
     await fs.mkdir(this.storageDirectory, { recursive: true });
     await fs.writeFile(path.join(this.storageDirectory, name), content);
+    // Registrar metadados; ignorar o próprio arquivo de metadados para evitar recursão.
+    if (name !== REPLICA_META_NAME) {
+      await this._withReplicaLock(async () => {
+        const meta = await this._readReplicaMeta();
+        meta[name] = {
+          hashId: hashId ?? null,
+          primaryNodeId: isReplica ? (primaryNodeId ?? null) : this.id,
+          isReplica: Boolean(isReplica)
+        };
+        await this._writeReplicaMeta(meta);
+      });
+    }
   }
 
   async readLocal(fileName) {
@@ -239,6 +279,154 @@ class ChordNode {
       throw error;
     }
   }
+
+  // ─── Replicação ─────────────────────────────────────────────────────────────
+
+  /**
+   * Retorna os metadados de replicação de um arquivo armazenado localmente.
+   * Lança erro com code 'ENOENT' se o arquivo não estiver registrado em replicas.json.
+   *
+   * @param {string} fileName
+   * @returns {Promise<{ hashId: number|null, primaryNodeId: number|null, isReplica: boolean }>}
+   */
+  async getReplicaMeta(fileName) {
+    const name = validateFileName(fileName);
+    const meta = await this._readReplicaMeta();
+    if (!meta[name]) {
+      const notFound = new Error(`Arquivo "${name}" não encontrado na rede`);
+      notFound.code = 'ENOENT';
+      throw notFound;
+    }
+    return meta[name];
+  }
+
+  /**
+   * Retorna todos os arquivos primários (não réplicas) armazenados localmente,
+   * excluindo o catálogo e o próprio arquivo de metadados.
+   *
+   * @returns {Promise<Array<{ name: string, hashId: number|null }>>}
+   */
+  async getAllPrimaryFiles() {
+    const meta = await this._readReplicaMeta();
+    return Object.entries(meta)
+      .filter(([name, info]) => !info.isReplica && name !== CATALOG_NAME)
+      .map(([name, info]) => ({ name, hashId: info.hashId }));
+  }
+
+  /**
+   * Retorna até REPLICA_COUNT nós únicos da Finger Table que não sejam o próprio nó,
+   * em ordem crescente de distância (finger[0] = sucessor imediato).
+   *
+   * @returns {Array<{ id: number, host: string, port: number }>}
+   */
+  getReplicationTargets() {
+    const seen = new Set([this.id]);
+    const targets = [];
+    for (const finger of this.fingers) {
+      if (targets.length >= REPLICA_COUNT) break;
+      const n = finger.node;
+      if (n && !seen.has(n.id)) {
+        seen.add(n.id);
+        targets.push(n);
+      }
+    }
+    return targets;
+  }
+
+  /**
+   * Garante que `fileName` está replicado nos nós alvo.
+   * Para cada nó, consulta `/rpc/replica-check` antes de transferir; só envia se ausente.
+   * Falhas individuais por nó são capturadas e logadas sem interromper os demais.
+   *
+   * @param {string} fileName
+   * @param {Buffer} content
+   * @param {number|null} hashId
+   */
+  async replicateFile(fileName, content, hashId) {
+    const targets = this.getReplicationTargets();
+    for (const target of targets) {
+      try {
+        const check = await this.rpc(target,
+          `/rpc/replica-check?name=${encodeURIComponent(fileName)}`);
+        if (check.exists) {
+          console.log(`[replicação] "${fileName}" já existe no nó ${target.id}, pulando.`);
+          continue;
+        }
+        await this.rpc(target, '/rpc/files', {
+          method: 'PUT',
+          body: {
+            name: fileName,
+            content: content.toString('base64'),
+            isReplica: true,
+            primaryNodeId: this.id,
+            hashId
+          }
+        });
+        console.log(`[replicação] "${fileName}" replicado com sucesso no nó ${target.id}.`);
+      } catch (error) {
+        console.error(
+          `[replicação] Falha ao replicar "${fileName}" no nó ${target.id}: ${error.message}`);
+      }
+    }
+  }
+
+  /**
+   * Percorre todos os arquivos primários locais e garante que suas réplicas
+   * existam nos nós alvo atuais da Finger Table.
+   * Chamado automaticamente via setImmediate após cada atualização da Finger Table.
+   */
+  async verifyReplicas() {
+    if (!this.joined) return;
+    let primaryFiles;
+    try {
+      primaryFiles = await this.getAllPrimaryFiles();
+    } catch (error) {
+      console.error(`[replicação] Não foi possível ler metadados: ${error.message}`);
+      return;
+    }
+    for (const file of primaryFiles) {
+      let content;
+      try {
+        content = await this.readLocal(file.name);
+      } catch {
+        // Arquivo pode ter sido removido do disco; ignora silenciosamente.
+        continue;
+      }
+      await this.replicateFile(file.name, content, file.hashId);
+    }
+  }
+
+  // ─── Infraestrutura de metadados de réplica ──────────────────────────────
+
+  /**
+   * Mutex via cadeia de Promises: serializa todas as leituras/escritas do replicas.json,
+   * evitando condições de corrida em operações concorrentes de armazenamento.
+   */
+  _withReplicaLock(fn) {
+    const next = this._replicaMetaLock.then(() => fn());
+    // Prevenir que rejeições de `fn` quebrem a cadeia para chamadas futuras.
+    this._replicaMetaLock = next.catch(() => {});
+    return next;
+  }
+
+  async _readReplicaMeta() {
+    const metaPath = path.join(this.storageDirectory, REPLICA_META_NAME);
+    try {
+      const data = await fs.readFile(metaPath, 'utf8');
+      return JSON.parse(data);
+    } catch (error) {
+      if (error.code === 'ENOENT') return {};
+      throw error;
+    }
+  }
+
+  async _writeReplicaMeta(meta) {
+    await fs.mkdir(this.storageDirectory, { recursive: true });
+    const metaPath = path.join(this.storageDirectory, REPLICA_META_NAME);
+    await fs.writeFile(metaPath, JSON.stringify(meta, null, 2));
+  }
+
+  // ─── Utilitários ─────────────────────────────────────────────────────────
 
   assertJoined() {
     if (!this.joined) throw new Error('O nó ainda não entrou em uma rede');
@@ -303,4 +491,10 @@ function normalizeReference(node) {
   };
 }
 
-module.exports = { ChordNode, normalizeReference, validateFileName, CATALOG_NAME };
+module.exports = {
+  ChordNode,
+  normalizeReference,
+  validateFileName,
+  CATALOG_NAME,
+  REPLICA_META_NAME
+};

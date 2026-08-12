@@ -4,7 +4,7 @@ const http = require('node:http');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { URL } = require('node:url');
-const { ChordNode, normalizeReference } = require('./chord-node');
+const { ChordNode, normalizeReference, CATALOG_NAME, REPLICA_META_NAME } = require('./chord-node');
 
 const PUBLIC_DIRECTORY = path.join(__dirname, '..', 'public');
 const STATIC_FILES = {
@@ -43,8 +43,11 @@ async function handleNodeRequest(node, request, response) {
     }
     if (request.method === 'POST' && url.pathname === '/api/files') {
       const body = await readJson(request);
-      if (body.name === 'catalogo.txt') {
+      if (body.name === CATALOG_NAME) {
         throw new Error('catalogo.txt é reservado para o controle da rede');
+      }
+      if (body.name === REPLICA_META_NAME) {
+        throw new Error(`${REPLICA_META_NAME} é reservado para o controle da rede`);
       }
       const content = Buffer.from(body.content || '', body.encoding === 'base64' ? 'base64' : 'utf8');
       return json(response, 201, await node.put(body.name, content));
@@ -86,13 +89,39 @@ async function handleNodeRequest(node, request, response) {
     if (request.method === 'PUT' && url.pathname === '/rpc/files') {
       const body = await readJson(request);
       const content = Buffer.from(body.content || '', 'base64');
-      await node.storeLocal(body.name, content);
+      const isReplica = Boolean(body.isReplica);
+      await node.storeLocal(body.name, content, {
+        isReplica,
+        primaryNodeId: body.primaryNodeId ?? null,
+        hashId: body.hashId ?? null
+      });
+      // Se o arquivo armazenado é primário, replicar para os próprios sucessores em background.
+      if (!isReplica && body.name !== CATALOG_NAME) {
+        setImmediate(() => {
+          node.replicateFile(body.name, content, body.hashId ?? null).catch((error) => {
+            console.error(`[replicação] Erro ao replicar "${body.name}": ${error.message}`);
+          });
+        });
+      }
       return json(response, 200, { ok: true, size: content.length });
     }
     if (request.method === 'GET' && url.pathname === '/rpc/files') {
       const name = url.searchParams.get('name');
       const content = await node.readLocal(name);
       return json(response, 200, { name, content: content.toString('base64') });
+    }
+    // Verifica se uma réplica existe antes de transferi-la, evitando envios desnecessários.
+    if (request.method === 'GET' && url.pathname === '/rpc/replica-check') {
+      const name = url.searchParams.get('name');
+      try {
+        const meta = await node.getReplicaMeta(name);
+        return json(response, 200, { exists: true, isReplica: meta.isReplica });
+      } catch (error) {
+        if (error.code === 'ENOENT') {
+          return json(response, 200, { exists: false, isReplica: false });
+        }
+        throw error;
+      }
     }
     return json(response, 404, { error: 'Rota não encontrada' });
   } catch (error) {
