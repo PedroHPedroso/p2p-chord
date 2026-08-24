@@ -97,6 +97,159 @@ test('posição sem nó armazena no próximo nó ativo através de HTTP', async 
   assert.match((await second.node.get('catalogo.txt')).content.toString(), new RegExp(name));
 });
 
+test('saída controlada religa os vizinhos e remove o nó das finger tables', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'chord-leave-ring-'));
+  const running = await startRing([8, 20, 28], directory);
+  t.after(async () => {
+    await Promise.allSettled(running.map((entry) => entry.close()));
+    await fs.rm(directory, { recursive: true, force: true });
+  });
+
+  const leaving = running[1].node.leave();
+  await assert.rejects(running[1].node.leave(), /já está saindo/);
+  await leaving;
+  await running[1].close();
+
+  assert.equal(running[0].node.predecessor.id, 28);
+  assert.equal(running[0].node.successor.id, 28);
+  assert.equal(running[2].node.predecessor.id, 8);
+  assert.equal(running[2].node.successor.id, 8);
+  assert.ok(running[0].node.fingers.every((finger) => finger.node.id !== 20));
+  assert.ok(running[2].node.fingers.every((finger) => finger.node.id !== 20));
+});
+
+test('saída transfere arquivos primários e catálogo para o sucessor', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'chord-leave-files-'));
+  const running = await startRing([8, 20, 28], directory);
+  t.after(async () => {
+    await Promise.allSettled(running.map((entry) => entry.close()));
+    await fs.rm(directory, { recursive: true, force: true });
+  });
+
+  let name;
+  for (let index = 0; index < 1000; index += 1) {
+    const candidate = `saida-${index}.bin`;
+    const position = hashKey(candidate);
+    if (position > 8 && position <= 20) {
+      name = candidate;
+      break;
+    }
+  }
+  const bytes = Buffer.from('arquivo preservado na saída');
+  assert.equal((await running[0].node.put(name, bytes)).node.id, 20);
+
+  await running[1].node.leave();
+  await running[1].close();
+
+  assert.deepEqual((await running[0].node.get(name)).content, bytes);
+  assert.match((await running[2].node.get('catalogo.txt')).content.toString(), new RegExp(name));
+  assert.equal((await running[2].node.getReplicaMeta(name)).isReplica, false);
+  assert.equal((await running[2].node.getReplicaMeta('catalogo.txt')).isReplica, false);
+  await running[2].node.storeLocal(name, Buffer.from('réplica atrasada'), {
+    isReplica: true,
+    primaryNodeId: 20,
+    hashId: hashKey(name)
+  });
+  assert.equal((await running[2].node.getReplicaMeta(name)).isReplica, false);
+  assert.deepEqual(await running[2].node.readLocal(name), bytes);
+});
+
+test('saída de dois nós para um faz o sobrevivente apontar para si mesmo', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'chord-leave-two-'));
+  const running = await startRing([8, 20], directory);
+  t.after(async () => {
+    await Promise.allSettled(running.map((entry) => entry.close()));
+    await fs.rm(directory, { recursive: true, force: true });
+  });
+
+  await running[1].node.leave();
+  await running[1].close();
+
+  assert.equal(running[0].node.predecessor.id, 8);
+  assert.equal(running[0].node.successor.id, 8);
+  assert.ok(running[0].node.fingers.every((finger) => finger.node.id === 8));
+});
+
+test('nó usado como bootstrap pode sair sem encerrar o anel', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'chord-leave-bootstrap-'));
+  const running = await startRing([8, 20, 28], directory);
+  t.after(async () => {
+    await Promise.allSettled(running.map((entry) => entry.close()));
+    await fs.rm(directory, { recursive: true, force: true });
+  });
+
+  await running[0].node.leave();
+  await running[0].close();
+
+  assert.equal(running[1].node.predecessor.id, 28);
+  assert.equal(running[1].node.successor.id, 28);
+  assert.equal(running[2].node.predecessor.id, 20);
+  assert.equal(running[2].node.successor.id, 20);
+  assert.ok(running[1].node.fingers.every((finger) => finger.node.id !== 8));
+  assert.ok(running[2].node.fingers.every((finger) => finger.node.id !== 8));
+});
+
+test('falha ao religar vizinhos desfaz a alteração e mantém o nó ativo', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'chord-leave-rollback-'));
+  const running = await startRing([8, 20, 28], directory);
+  t.after(async () => {
+    await Promise.allSettled(running.map((entry) => entry.close()));
+    await fs.rm(directory, { recursive: true, force: true });
+  });
+
+  await running[0].close();
+  await assert.rejects(running[1].node.leave());
+
+  assert.equal(running[1].node.joined, true);
+  assert.equal(running[1].node.leaving, false);
+  assert.equal(running[2].node.predecessor.id, 20);
+});
+
+test('falha na migração mantém o nó e a topologia original ativos', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'chord-leave-transfer-failure-'));
+  const running = await startRing([8, 20, 28], directory);
+  t.after(async () => {
+    await Promise.allSettled(running.map((entry) => entry.close()));
+    await fs.rm(directory, { recursive: true, force: true });
+  });
+
+  await running[1].node.storeLocal('migracao.bin', Buffer.from('conteúdo'), {
+    hashId: 14
+  });
+  await running[2].close();
+  await assert.rejects(running[1].node.leave());
+
+  assert.equal(running[1].node.joined, true);
+  assert.equal(running[1].node.leaving, false);
+  assert.equal(running[1].node.predecessor.id, 8);
+  assert.equal(running[1].node.successor.id, 28);
+  assert.equal(running[0].node.successor.id, 20);
+});
+
+test('único nó pode sair sem consultar a rede', async () => {
+  const node = new ChordNode({ id: 8 });
+  await node.join(null);
+  const state = await node.leave();
+  assert.equal(state.joined, false);
+  assert.equal(state.predecessor, null);
+  assert.equal(state.successor, null);
+  assert.ok(state.fingerTable.every((finger) => finger.node === null));
+});
+
+async function startRing(ids, directory) {
+  const running = [];
+  for (const id of ids) {
+    const entry = await startNodeServer({
+      id,
+      port: await freePort(),
+      storageDirectory: path.join(directory, String(id))
+    });
+    await entry.node.join(running[0]?.node.reference || null);
+    running.push(entry);
+  }
+  return running;
+}
+
 async function freePort() {
   const server = net.createServer();
   await new Promise((resolve, reject) => {

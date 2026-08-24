@@ -26,8 +26,10 @@ async function startNodeServer(options) {
   return {
     node,
     server,
-    close: () => new Promise((resolve, reject) =>
-      server.close((error) => error ? reject(error) : resolve()))
+    close: () => new Promise((resolve, reject) => {
+      if (!server.listening) return resolve();
+      server.close((error) => error ? reject(error) : resolve());
+    })
   };
 }
 
@@ -74,17 +76,26 @@ async function handleNodeRequest(node, request, response) {
       return json(response, 200, { node: node.predecessor });
     }
     if (request.method === 'PUT' && url.pathname === '/rpc/predecessor') {
-      node.predecessor = normalizeReference((await readJson(request)).node);
+      const body = await readJson(request);
+      assertExpectedNeighbor(node.predecessor, body.expectedId, 'predecessor');
+      node.predecessor = normalizeReference(body.node);
       return json(response, 200, { ok: true });
     }
     if (request.method === 'PUT' && url.pathname === '/rpc/successor') {
-      node.successor = normalizeReference((await readJson(request)).node);
+      const body = await readJson(request);
+      assertExpectedNeighbor(node.successor, body.expectedId, 'sucessor');
+      node.successor = normalizeReference(body.node);
       return json(response, 200, { ok: true });
     }
     if (request.method === 'POST' && url.pathname === '/rpc/refresh-fingers') {
       const body = await readJson(request);
       return json(response, 200,
         await node.refreshRingFingerTables(body.originId, body.hops || 0));
+    }
+    if (request.method === 'POST' && url.pathname === '/rpc/repair-fingers') {
+      const body = await readJson(request);
+      return json(response, 200,
+        await node.repairRingFingerTables(body.originId, body.hops || 0));
     }
     if (request.method === 'PUT' && url.pathname === '/rpc/files') {
       const body = await readJson(request);
@@ -125,10 +136,20 @@ async function handleNodeRequest(node, request, response) {
     }
     return json(response, 404, { error: 'Rota não encontrada' });
   } catch (error) {
-    const status = error.name === 'AbortError' || error.code === 'ETIMEDOUT'
-      ? 504 : error.code === 'ENOENT' ? 404 : 400;
+    const status = error.status || (error.name === 'AbortError' || error.code === 'ETIMEDOUT'
+      ? 504 : error.code === 'ENOENT' ? 404
+        : error.code === 'ESTALE_TOPOLOGY' || error.code === 'ELEAVEINPROGRESS' ? 409 : 400);
     return json(response, status, { error: error.message });
   }
+}
+
+function assertExpectedNeighbor(current, expectedId, label) {
+  if (expectedId === undefined || expectedId === null) return;
+  if (current?.id === Number(expectedId)) return;
+  const conflict = new Error(
+    `O ${label} mudou: esperado ${expectedId}, atual ${current?.id ?? 'nenhum'}`);
+  conflict.code = 'ESTALE_TOPOLOGY';
+  throw conflict;
 }
 
 function json(response, status, value) {

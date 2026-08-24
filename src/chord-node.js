@@ -26,6 +26,13 @@ class ChordNode {
     this.predecessor = null;
     this.fingers = this.buildEmptyFingerTable();
     this.joined = false;
+    this.leaving = false;
+    this._leavePhase = 'active';
+    this._leaveSuccessor = null;
+    this._leavePromise = null;
+    this._leaveDetached = false;
+    this._leaveSuccessorRewired = false;
+    this._primaryWriteLock = Promise.resolve();
     // Mutex via cadeia de Promises para serializar leituras/escritas do replicas.json.
     this._replicaMetaLock = Promise.resolve();
   }
@@ -109,6 +116,109 @@ class ChordNode {
     return this.state();
   }
 
+  /**
+   * Retira voluntariamente este no do anel. O servidor deve permanecer aberto
+   * ate esta operacao terminar para que fingers antigas ainda possam usa-lo
+   * como ponte durante a reparacao.
+   */
+  async leave() {
+    if (this._leavePromise) {
+      const conflict = new Error(`O nó ${this.id} já está saindo da rede`);
+      conflict.code = 'ELEAVEINPROGRESS';
+      throw conflict;
+    }
+    this._leavePromise = this._performLeave();
+    try {
+      return await this._leavePromise;
+    } finally {
+      this._leavePromise = null;
+    }
+  }
+
+  async _performLeave() {
+    this.assertJoined();
+
+    const successor = this._leaveSuccessor || this.successor;
+    const predecessor = this.predecessor;
+    if (!successor || !predecessor) throw new Error('Topologia incompleta para sair da rede');
+
+    if (successor.id === this.id && predecessor.id === this.id) {
+      this.joined = false;
+      this.leaving = false;
+      this._leavePhase = 'left';
+      this.predecessor = null;
+      this.fingers = this.buildEmptyFingerTable();
+      return this.state();
+    }
+
+    this.leaving = true;
+    this._leavePhase = 'draining';
+    this._leaveSuccessor = successor;
+
+    if (!this._leaveDetached) {
+      try {
+        await this._withPrimaryWriteLock(() => this._transferPrimaryFiles(successor));
+      } catch (error) {
+        this._resetLeaveState();
+        throw error;
+      }
+
+      let successorChanged = this._leaveSuccessorRewired;
+      try {
+        if (!successorChanged) {
+          await this.rpc(successor, '/rpc/predecessor', {
+            method: 'PUT',
+            body: { node: predecessor, expectedId: this.id }
+          });
+          successorChanged = true;
+          this._leaveSuccessorRewired = true;
+        }
+        await this.rpc(predecessor, '/rpc/successor', {
+          method: 'PUT',
+          body: { node: successor, expectedId: this.id }
+        });
+        this._leaveDetached = true;
+        this._leaveSuccessorRewired = false;
+      } catch (error) {
+        if (successorChanged) {
+          try {
+            await this.rpc(successor, '/rpc/predecessor', {
+              method: 'PUT',
+              body: { node: this.reference, expectedId: predecessor.id }
+            });
+            successorChanged = false;
+            this._leaveSuccessorRewired = false;
+          } catch (rollbackError) {
+            error.message += `; tambem falhou o rollback: ${rollbackError.message}`;
+          }
+        }
+        if (!successorChanged) this._resetLeaveState();
+        throw error;
+      }
+    }
+
+    await this.rpc(successor, '/rpc/repair-fingers', {
+      method: 'POST',
+      body: { originId: successor.id, hops: 0 }
+    });
+
+    await this._withPrimaryWriteLock(async () => {
+      await this._transferPrimaryFiles(successor);
+      this._leavePhase = 'forwarding';
+    });
+
+    this.joined = false;
+    return this.state();
+  }
+
+  _resetLeaveState() {
+    this.leaving = false;
+    this._leavePhase = 'active';
+    this._leaveSuccessor = null;
+    this._leaveDetached = false;
+    this._leaveSuccessorRewired = false;
+  }
+
   async refreshFingerTable() {
     const nodes = await Promise.all(this.fingers.map((finger) =>
       this.findSuccessor(finger.start)));
@@ -144,11 +254,28 @@ class ChordNode {
     return { ok: true };
   }
 
+  /** Recalcula as fingers do anel inteiro e so responde ao concluir a volta. */
+  async repairRingFingerTables(originId, hops = 0) {
+    const origin = validateId(originId);
+    if (hops > 0 && this.id === origin) return { ok: true };
+    if (hops >= 32) throw new Error('Limite de nos excedido ao reparar finger tables');
+
+    await this.refreshFingerTable();
+    const next = this.successor;
+    if (next.id === origin) return { ok: true };
+    return this.rpc(next, '/rpc/repair-fingers', {
+      method: 'POST',
+      body: { originId: origin, hops: hops + 1 }
+    });
+  }
+
   async findSuccessor(rawId, hops = 0) {
     const id = validateId(rawId);
-    if (!this.joined || !this.successor) throw new Error('O nó ainda não entrou em uma rede');
+    if ((!this.joined && !this.leaving) || !this.successor) {
+      throw new Error('O nó ainda não entrou em uma rede');
+    }
     if (this.successor.id === this.id) return this.reference;
-    if (id === this.id) return this.reference;
+    if (id === this.id) return this.leaving ? this.successor : this.reference;
 
     if (inInterval(id, this.id, this.successor.id, false, true)) {
       return this.successor;
@@ -250,20 +377,41 @@ class ChordNode {
    */
   async storeLocal(fileName, content, { isReplica = false, primaryNodeId, hashId } = {}) {
     const name = validateFileName(fileName);
-    await fs.mkdir(this.storageDirectory, { recursive: true });
-    await fs.writeFile(path.join(this.storageDirectory, name), content);
-    // Registrar metadados; ignorar o próprio arquivo de metadados para evitar recursão.
-    if (name !== REPLICA_META_NAME) {
-      await this._withReplicaLock(async () => {
-        const meta = await this._readReplicaMeta();
-        meta[name] = {
-          hashId: hashId ?? null,
-          primaryNodeId: isReplica ? (primaryNodeId ?? null) : this.id,
-          isReplica: Boolean(isReplica)
-        };
-        await this._writeReplicaMeta(meta);
-      });
-    }
+    const bytes = Buffer.isBuffer(content) ? content : Buffer.from(content);
+    const write = async () => {
+      if (!isReplica && this.leaving && this._leavePhase === 'forwarding') {
+        await this._forwardPrimaryFile(name, bytes, hashId);
+        return;
+      }
+
+      // Uma réplica atrasada nunca pode rebaixar nem sobrescrever um primário
+      // que já foi armazenado neste nó.
+      if (isReplica) {
+        const currentMeta = await this._readReplicaMeta();
+        if (currentMeta[name] && !currentMeta[name].isReplica) return;
+      }
+
+      await fs.mkdir(this.storageDirectory, { recursive: true });
+      await fs.writeFile(path.join(this.storageDirectory, name), bytes);
+      // Registrar metadados; ignorar o próprio arquivo de metadados para evitar recursão.
+      if (name !== REPLICA_META_NAME) {
+        await this._withReplicaLock(async () => {
+          const meta = await this._readReplicaMeta();
+          meta[name] = {
+            hashId: hashId ?? null,
+            primaryNodeId: isReplica ? (primaryNodeId ?? null) : this.id,
+            isReplica: Boolean(isReplica)
+          };
+          await this._writeReplicaMeta(meta);
+        });
+      }
+
+      if (!isReplica && this.leaving && this._leaveSuccessor) {
+        await this._forwardPrimaryFile(name, bytes, hashId);
+      }
+    };
+
+    return this._withPrimaryWriteLock(write);
   }
 
   async readLocal(fileName) {
@@ -306,11 +454,40 @@ class ChordNode {
    *
    * @returns {Promise<Array<{ name: string, hashId: number|null }>>}
    */
-  async getAllPrimaryFiles() {
+  async getAllPrimaryFiles({ includeCatalog = false } = {}) {
     const meta = await this._readReplicaMeta();
     return Object.entries(meta)
-      .filter(([name, info]) => !info.isReplica && name !== CATALOG_NAME)
+      .filter(([name, info]) => !info.isReplica && (includeCatalog || name !== CATALOG_NAME))
       .map(([name, info]) => ({ name, hashId: info.hashId }));
+  }
+
+  async _transferPrimaryFiles(successor) {
+    const files = await this.getAllPrimaryFiles({ includeCatalog: true });
+    for (const file of files) {
+      const content = await this.readLocal(file.name);
+      await this.rpc(successor, '/rpc/files', {
+        method: 'PUT',
+        body: {
+          name: file.name,
+          content: content.toString('base64'),
+          isReplica: false,
+          hashId: file.hashId
+        }
+      });
+    }
+  }
+
+  async _forwardPrimaryFile(name, content, hashId) {
+    if (!this._leaveSuccessor) throw new Error('Sucessor de saída não definido');
+    await this.rpc(this._leaveSuccessor, '/rpc/files', {
+      method: 'PUT',
+      body: {
+        name,
+        content: content.toString('base64'),
+        isReplica: false,
+        hashId: hashId ?? null
+      }
+    });
   }
 
   /**
@@ -409,6 +586,12 @@ class ChordNode {
     return next;
   }
 
+  _withPrimaryWriteLock(fn) {
+    const next = this._primaryWriteLock.then(() => fn());
+    this._primaryWriteLock = next.catch(() => {});
+    return next;
+  }
+
   async _readReplicaMeta() {
     const metaPath = path.join(this.storageDirectory, REPLICA_META_NAME);
     try {
@@ -429,7 +612,7 @@ class ChordNode {
   // ─── Utilitários ─────────────────────────────────────────────────────────
 
   assertJoined() {
-    if (!this.joined) throw new Error('O nó ainda não entrou em uma rede');
+    if (!this.joined && !this.leaving) throw new Error('O nó ainda não entrou em uma rede');
   }
 
   async rpc(node, path, { method = 'GET', body } = {}) {
@@ -444,7 +627,11 @@ class ChordNode {
         signal: controller.signal
       });
       const data = await response.json();
-      if (!response.ok) throw new Error(data.error || `Erro HTTP ${response.status}`);
+      if (!response.ok) {
+        const requestError = new Error(data.error || `Erro HTTP ${response.status}`);
+        requestError.status = response.status;
+        throw requestError;
+      }
       return data;
     } catch (error) {
       if (error.name === 'AbortError') {

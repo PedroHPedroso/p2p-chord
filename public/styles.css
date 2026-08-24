@@ -51,6 +51,7 @@ h2 { margin-bottom: 4px; font-size: 20px; letter-spacing: -.02em; }
 .button:disabled { opacity: .55; cursor: wait; transform: none; }
 .button.primary { color: #07110d; background: var(--accent); border-color: var(--accent); }
 .button.secondary { color: var(--text); background: var(--panel); }
+.button.danger { color: #ffc9c9; background: #351c22; border-color: #713541; }
 .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 18px; }
 .stat-card { min-width: 0; padding: 20px; border: 1px solid var(--border); border-radius: 14px; background: linear-gradient(145deg, var(--panel-2), var(--panel)); }
 .stat-card.current { border-color: #2d6652; }
@@ -113,6 +114,7 @@ td:first-child { color: var(--muted); }
 .node-card > div:nth-child(2) span { color: var(--muted); font-size: 12px; }
 .node-links { display: flex; gap: 12px; color: var(--muted); font-size: 12px; }
 .node-card a { text-decoration: none; }
+.node-actions { display: flex; gap: 8px; }
 
 @media (max-width: 850px) {
   .stats { grid-template-columns: repeat(2, 1fr); }
@@ -132,5 +134,7 @@ td:first-child { color: var(--muted); }
   .upload-form .button { width: 100%; }
   .node-card { grid-template-columns: auto 1fr; }
   .node-links { display: none; }
+  .node-actions { grid-column: 1 / -1; }
+  .node-actions .button { flex: 1; text-align: center; }
   .ring { --ring-radius: min(42vw, 145px); }
 }
