@@ -157,13 +157,38 @@ function renderCatalog(names) {
     const icon = document.createElement('span');
     icon.className = 'file-icon';
     icon.textContent = '↓';
-    const label = document.createElement('span');
+    const details = document.createElement('span');
+    details.className = 'catalog-file-details';
+    const label = document.createElement('strong');
     label.textContent = name;
+    const locations = document.createElement('small');
+    locations.className = 'file-locations';
+    locations.textContent = 'Consultando cópias…';
+    details.append(label, locations);
     const action = document.createElement('small');
     action.textContent = 'Baixar';
-    link.append(icon, label, action);
+    link.append(icon, details, action);
+    fillFileLocations(name, locations);
     return link;
   }));
+}
+
+async function fillFileLocations(name, target) {
+  try {
+    const response = await fetch(`/api/files/locations?name=${encodeURIComponent(name)}`, {
+      cache: 'no-store'
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `Falha HTTP ${response.status}`);
+    const primary = result.locations.find((location) => location.role === 'primary');
+    const replicas = result.locations.filter((location) => location.role === 'replica');
+    const parts = [];
+    if (primary) parts.push(`Primário: nó ${primary.id}`);
+    if (replicas.length) parts.push(`Réplicas: ${replicas.map((node) => `nó ${node.id}`).join(', ')}`);
+    target.textContent = parts.join(' · ') || 'Nenhuma cópia online encontrada';
+  } catch {
+    target.textContent = 'Localizações indisponíveis';
+  }
 }
 
 async function refreshCatalog() {
@@ -286,9 +311,15 @@ elements.uploadForm.addEventListener('submit', async (event) => {
     });
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || 'Não foi possível enviar o arquivo');
-    elements.uploadMessage.textContent = result.replicaNode
-      ? `Arquivo armazenado pelo nó ${result.node.id} (hash ${result.hashId}); réplica no nó ${result.replicaNode.id}.`
-      : `Arquivo armazenado pelo nó ${result.node.id} (hash ${result.hashId}).`;
+    const primaryNode = result.primary || result.node;
+    const replicaList = Array.isArray(result.replicas)
+      ? result.replicas
+      : (result.replicaNode ? [result.replicaNode] : []);
+    const primary = `nó ${primaryNode.id} (${address(primaryNode)})`;
+    const replicas = replicaList.length
+      ? replicaList.map((node) => `nó ${node.id} (${address(node)})`).join(', ')
+      : 'nenhuma cópia confirmada';
+    elements.uploadMessage.textContent = `Hash ${result.hashId}. Primário: ${primary}. Réplicas: ${replicas}.`;
     elements.uploadForm.reset();
     elements.selectedFile.textContent = 'Nenhum arquivo selecionado';
     await refreshCatalog();

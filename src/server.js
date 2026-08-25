@@ -38,6 +38,22 @@ const server = http.createServer(async (request, response) => {
         suggestedHost: suggestedHost || addresses[0] || '127.0.0.1'
       });
     }
+    const deleteNodeMatch = url.pathname.match(/^\/api\/nodes\/(\d+)$/);
+    if (request.method === 'DELETE' && deleteNodeMatch) {
+      const port = Number(deleteNodeMatch[1]);
+      const running = nodes.get(port);
+      if (!running) {
+        const notFound = new Error(`Não existe nó local na porta ${port}`);
+        notFound.code = 'ENODENOTFOUND';
+        throw notFound;
+      }
+
+      const reference = running.node.reference;
+      await running.node.leave();
+      await running.close();
+      nodes.delete(port);
+      return json(response, 200, { ok: true, node: reference });
+    }
     if (request.method === 'POST' && url.pathname === '/api/nodes') {
       const body = await readJson(request);
       const port = Number(body.port);
@@ -75,7 +91,10 @@ const server = http.createServer(async (request, response) => {
     }
     return json(response, 404, { error: 'Rota não encontrada' });
   } catch (error) {
-    return json(response, 400, { error: error.message });
+    const status = error.code === 'ENODENOTFOUND' ? 404
+      : error.code === 'ELEAVEINPROGRESS' || error.status === 409 ? 409
+        : error.status || 400;
+    return json(response, status, { error: error.message });
   }
 });
 
@@ -86,6 +105,39 @@ server.listen(CONTROL_PORT, '0.0.0.0', () => {
     console.log(`Painel Chord na rede: http://${address}:${CONTROL_PORT}`);
   }
 });
+
+let shuttingDown = false;
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`\n${signal}: retirando nós locais da rede...`);
+
+  for (const [port, running] of Array.from(nodes.entries())) {
+    try {
+      await running.node.leave();
+    } catch (error) {
+      console.error(`Não foi possível retirar o nó ${running.node.id}: ${error.message}`);
+      process.exitCode = 1;
+    }
+    try {
+      await running.close();
+      nodes.delete(port);
+    } catch (error) {
+      console.error(`Não foi possível fechar o nó ${running.node.id}: ${error.message}`);
+      process.exitCode = 1;
+    }
+  }
+
+  server.close((error) => {
+    if (error) {
+      console.error(`Não foi possível fechar o painel: ${error.message}`);
+      process.exitCode = 1;
+    }
+  });
+}
+
+process.once('SIGINT', () => shutdown('SIGINT'));
+process.once('SIGTERM', () => shutdown('SIGTERM'));
 
 function localIPv4Addresses() {
   return Object.values(os.networkInterfaces())

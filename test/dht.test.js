@@ -84,13 +84,14 @@ test('get recupera a réplica remota com três nós após a queda do dono', asyn
   assert.equal(stored.node.id, 20);
   assert.equal(stored.replicaNode.id, 28);
   assert.equal(third.node.store.isReplica(name), true);
+  assert.equal(first.node.store.isReplica(name), true);
 
   await second.close();
 
   const recovered = await first.node.get(name);
   assert.deepEqual(recovered.content, bytes);
   assert.equal(recovered.source, 'replica');
-  assert.equal(recovered.node.id, 28);
+  assert.ok([8, 28].includes(recovered.node.id));
 });
 
 async function twoNodeNetwork(t, extra = {}) {
