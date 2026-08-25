@@ -48,9 +48,9 @@
         <span id="successor-address" class="stat-detail">Não definido</span>
       </article>
       <article class="stat-card">
-        <span class="stat-label">Finger entries</span>
-        <strong>5</strong>
-        <span class="stat-detail">m = log₂(32)</span>
+        <span class="stat-label">Sucessores</span>
+        <strong id="successors-count">—</strong>
+        <span id="successors-list" class="stat-detail">Lista vazia</span>
       </article>
     </section>
 
@@ -108,6 +108,26 @@
         </div>
       </section>
     </div>
+
+    <section id="storage-panel" class="panel storage-panel" hidden>
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Estado local · DHT</p>
+          <h2>Arquivos neste nó</h2>
+          <p class="muted">Primários (este nó é o dono pelo hash) e réplicas (2ª cópia recebida do responsável).</p>
+        </div>
+      </div>
+      <div class="storage-grid">
+        <div>
+          <h3>Arquivos primários</h3>
+          <div id="primary-files-list" class="storage-list"></div>
+        </div>
+        <div>
+          <h3>Arquivos réplica</h3>
+          <div id="replica-files-list" class="storage-list"></div>
+        </div>
+      </div>
+    </section>
 
     <section id="files-panel" class="panel files-panel" hidden>
       <div class="panel-heading">

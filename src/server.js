@@ -26,6 +26,7 @@ const server = http.createServer(async (request, response) => {
       return sendFile(response, path.join(PUBLIC_DIRECTORY, file), contentType);
     }
     if (request.method === 'GET' && url.pathname === '/api/nodes') {
+      await Promise.all(Array.from(nodes.values(), ({ node }) => node.store.ensureLoaded()));
       return json(response, 200, Array.from(nodes.values(), ({ node }) => node.state()));
     }
     if (request.method === 'GET' && url.pathname === '/api/network') {

@@ -11,6 +11,8 @@ const elements = {
   predecessorAddress: document.querySelector('#predecessor-address'),
   successorId: document.querySelector('#successor-id'),
   successorAddress: document.querySelector('#successor-address'),
+  successorsCount: document.querySelector('#successors-count'),
+  successorsList: document.querySelector('#successors-list'),
   fingerBody: document.querySelector('#finger-body'),
   ring: document.querySelector('#ring'),
   lastUpdate: document.querySelector('#last-update'),
@@ -28,7 +30,10 @@ const elements = {
   uploadFile: document.querySelector('#upload-file'),
   selectedFile: document.querySelector('#selected-file'),
   uploadButton: document.querySelector('#upload-button'),
-  uploadMessage: document.querySelector('#upload-message')
+  uploadMessage: document.querySelector('#upload-message'),
+  storagePanel: document.querySelector('#storage-panel'),
+  primaryFilesList: document.querySelector('#primary-files-list'),
+  replicaFilesList: document.querySelector('#replica-files-list')
 };
 
 let refreshing = false;
@@ -94,11 +99,47 @@ function render(state) {
   elements.joinedLabel.classList.toggle('active', state.joined);
   elements.joinPanel.hidden = state.joined;
   elements.filesPanel.hidden = !state.joined;
+  elements.storagePanel.hidden = !state.joined;
   renderNode(elements.predecessorId, elements.predecessorAddress, state.predecessor);
   renderNode(elements.successorId, elements.successorAddress, state.successor);
+  renderSuccessors(state.successors || []);
+  renderLocalFiles(elements.primaryFilesList, state.primaryFiles || [], 'primary');
+  renderLocalFiles(elements.replicaFilesList, state.replicaFiles || [], 'replica');
   renderTable(state.fingerTable);
   renderRing(state);
   elements.lastUpdate.textContent = `Atualizado às ${new Date().toLocaleTimeString('pt-BR')}`;
+}
+
+function renderSuccessors(successors) {
+  elements.successorsCount.textContent = successors.length;
+  elements.successorsList.textContent = successors.length
+    ? successors.map((node) => node.id).join(' → ')
+    : 'Lista vazia';
+}
+
+function renderLocalFiles(container, files, kind) {
+  const empty = kind === 'primary'
+    ? 'Nenhum arquivo primário neste nó.'
+    : 'Nenhuma réplica neste nó.';
+  if (!files.length) {
+    container.innerHTML = `<p class="empty-row">${empty}</p>`;
+    return;
+  }
+
+  container.replaceChildren(...files.map((file) => {
+    const item = document.createElement('div');
+    item.className = `storage-file ${kind}`;
+    const title = document.createElement('strong');
+    title.textContent = file.name;
+    const meta = document.createElement('span');
+    const parts = [];
+    if (file.hashId != null) parts.push(`hash ${file.hashId}`);
+    if (file.size != null) parts.push(`${file.size} bytes`);
+    if (file.primaryNodeId != null) parts.push(`dono ${file.primaryNodeId}`);
+    meta.textContent = parts.join(' · ');
+    item.append(title, meta);
+    return item;
+  }));
 }
 
 function renderCatalog(names) {
@@ -245,7 +286,9 @@ elements.uploadForm.addEventListener('submit', async (event) => {
     });
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || 'Não foi possível enviar o arquivo');
-    elements.uploadMessage.textContent = `Arquivo armazenado pelo nó ${result.node.id} (hash ${result.hashId}).`;
+    elements.uploadMessage.textContent = result.replicaNode
+      ? `Arquivo armazenado pelo nó ${result.node.id} (hash ${result.hashId}); réplica no nó ${result.replicaNode.id}.`
+      : `Arquivo armazenado pelo nó ${result.node.id} (hash ${result.hashId}).`;
     elements.uploadForm.reset();
     elements.selectedFile.textContent = 'Nenhum arquivo selecionado';
     await refreshCatalog();

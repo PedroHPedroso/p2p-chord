@@ -42,6 +42,8 @@ async function loadNodes() {
       card.className = 'node-card';
       const predecessor = state.predecessor?.id ?? '—';
       const successor = state.successor?.id ?? '—';
+      const primaryCount = (state.primaryFiles || []).length;
+      const replicaCount = (state.replicaFiles || []).length;
       card.innerHTML = `
         <div class="node-card-id">${state.node.id}</div>
         <div>
@@ -49,6 +51,7 @@ async function loadNodes() {
           <span>${nodeAddress(state.node)}</span>
         </div>
         <div class="node-links"><span>← ${predecessor}</span><span>${successor} →</span></div>
+        <div class="node-files">${primaryCount} primários · ${replicaCount} réplicas</div>
         <a class="button secondary" href="http://${nodeAddress(state.node)}">Abrir painel</a>`;
       return card;
     }));

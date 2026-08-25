@@ -1,12 +1,11 @@
 'use strict';
 
-const fs = require('node:fs/promises');
 const path = require('node:path');
 const { FINGER_COUNT, add, hashKey, inInterval, validateId } = require('./ring');
+const { FileStore, fileNotFound } = require('./file-store');
 
 const CATALOG_NAME = 'catalogo.txt';
-const REPLICA_META_NAME = 'replicas.json'; // arquivo de metadados de replicação (reservado)
-const REPLICA_COUNT = 2; // número de sucessores diretos que receberão réplicas
+const REPLICA_COUNT = 1;
 
 class ChordNode {
   constructor({ id, host = '127.0.0.1', port = 5000, requestTimeout = 10000,
@@ -23,15 +22,22 @@ class ChordNode {
     this.requestTimeout = requestTimeout;
     this.storageDirectory = storageDirectory || path.join(
       process.cwd(), 'data', `node-${this.id}-${this.port}`);
+    this.store = new FileStore(this.storageDirectory);
     this.predecessor = null;
     this.fingers = this.buildEmptyFingerTable();
     this.joined = false;
-    // Mutex via cadeia de Promises para serializar leituras/escritas do replicas.json.
-    this._replicaMetaLock = Promise.resolve();
   }
 
   get reference() {
     return { id: this.id, host: this.host, port: this.port };
+  }
+
+  get primaryFiles() {
+    return this.store.primaryFiles;
+  }
+
+  get replicaFiles() {
+    return this.store.replicaFiles;
   }
 
   buildEmptyFingerTable() {
@@ -66,7 +72,6 @@ class ChordNode {
     const contact = normalizeReference(bootstrap);
     if (contact.id === this.id) throw new Error('O nó de entrada não pode ter o mesmo id');
 
-    // Localiza a posição do novo nó no anel usando o nó de entrada.
     const successor = await this.rpc(contact, '/rpc/find-successor', {
       method: 'POST',
       body: { id: this.id }
@@ -79,7 +84,6 @@ class ChordNode {
     this.successor = successor;
     this.predecessor = predecessor;
 
-    // Faz o novo nó entrar entre predecessor e sucessor.
     await this.rpc(successor, '/rpc/predecessor', {
       method: 'PUT',
       body: { node: this.reference }
@@ -90,7 +94,6 @@ class ChordNode {
         body: { node: this.reference }
       });
     } else {
-      // A rede possuía apenas um nó.
       await this.rpc(successor, '/rpc/successor', {
         method: 'PUT',
         body: { node: this.reference }
@@ -101,7 +104,6 @@ class ChordNode {
 
     await this.refreshFingerTable();
 
-    // A entrada altera também as fingers dos nós que já estavam no anel.
     await this.rpc(this.successor, '/rpc/refresh-fingers', {
       method: 'POST',
       body: { originId: this.id, hops: 0 }
@@ -115,7 +117,6 @@ class ChordNode {
     this.fingers.forEach((finger, index) => {
       finger.node = nodes[index];
     });
-    // Após atualizar a Finger Table, verificar e sincronizar réplicas em background.
     setImmediate(() => {
       this.verifyReplicas().catch((error) => {
         console.error(`[replicação] Erro em verifyReplicas após refreshFingerTable: ${error.message}`);
@@ -130,8 +131,6 @@ class ChordNode {
 
     await this.refreshFingerTable();
 
-    // Cada nó responde após atualizar a própria tabela. O próximo salto ocorre
-    // fora da requisição atual para o tempo total não crescer com o anel.
     const next = this.successor;
     setImmediate(() => {
       this.rpc(next, '/rpc/refresh-fingers', {
@@ -144,32 +143,42 @@ class ChordNode {
     return { ok: true };
   }
 
-  async findSuccessor(rawId, hops = 0) {
+  async findSuccessor(rawId, hops = 0, skipIds = []) {
     const id = validateId(rawId);
     if (!this.joined || !this.successor) throw new Error('O nó ainda não entrou em uma rede');
-    if (this.successor.id === this.id) return this.reference;
-    if (id === this.id) return this.reference;
+    const skip = new Set((skipIds || []).map(Number));
 
-    if (inInterval(id, this.id, this.successor.id, false, true)) {
-      return this.successor;
+    if (this.successor.id === this.id) return this.reference;
+    if (id === this.id && !skip.has(this.id)) return this.reference;
+
+    const actingSuccessor = this.firstKnownSuccessor(skip) || this.reference;
+    if (actingSuccessor.id === this.id) return this.reference;
+
+    if (inInterval(id, this.id, actingSuccessor.id, false, true)) {
+      return actingSuccessor;
     }
 
     if (hops >= 32) throw new Error('Limite de saltos excedido ao procurar sucessor');
-    let next = this.closestPrecedingFinger(id);
-    // Uma finger table ainda desatualizada não deve interromper a busca:
-    // caminhar pelo sucessor sempre encontra a posição correta no anel.
-    if (next.id === this.id) next = this.successor;
+    let next = this.closestPrecedingFinger(id, skip);
+    if (next.id === this.id || skip.has(next.id)) next = actingSuccessor;
 
-    return this.rpc(next, '/rpc/find-successor', {
-      method: 'POST',
-      body: { id, hops: hops + 1 }
-    });
+    try {
+      return await this.rpc(next, '/rpc/find-successor', {
+        method: 'POST',
+        body: { id, hops: hops + 1, skipIds: [...skip] }
+      });
+    } catch (error) {
+      if (!isUnreachableError(error)) throw error;
+      skip.add(next.id);
+      return this.findSuccessor(id, hops, [...skip]);
+    }
   }
 
-  closestPrecedingFinger(id) {
+  closestPrecedingFinger(id, skip = new Set()) {
     for (let i = this.fingers.length - 1; i >= 0; i -= 1) {
       const candidate = this.fingers[i].node;
       if (candidate && candidate.id !== this.id
+        && !skip.has(candidate.id)
         && inInterval(candidate.id, this.id, id, false, false)) {
         return candidate;
       }
@@ -177,50 +186,115 @@ class ChordNode {
     return this.reference;
   }
 
-  /** Insere bytes na rede e devolve a posição do hash e o nó responsável. */
+  /**
+   * Sucessores únicos conhecidos pela finger table, em ordem crescente de distância.
+   * O primeiro elemento é o sucessor imediato.
+   */
+  getSuccessorList() {
+    const seen = new Set([this.id]);
+    const successors = [];
+    for (const finger of this.fingers) {
+      const node = finger.node;
+      if (node && !seen.has(node.id)) {
+        seen.add(node.id);
+        successors.push(node);
+      }
+    }
+    return successors;
+  }
+
+  firstKnownSuccessor(skip = new Set()) {
+    return this.getSuccessorList().find((node) => !skip.has(node.id)) || null;
+  }
+
+  /** Insere bytes na rede, grava no dono primário e replica no sucessor imediato. */
   async put(fileName, content, { updateCatalog = true } = {}) {
     this.assertJoined();
     const name = validateFileName(fileName);
     const bytes = Buffer.isBuffer(content) ? content : Buffer.from(content);
     const hashId = hashKey(name);
     const owner = await this.findSuccessor(hashId);
+    let replicaNode = null;
 
     if (owner.id === this.id) {
       await this.storeLocal(name, bytes, { isReplica: false, primaryNodeId: this.id, hashId });
-      // Replicar para os sucessores em background, sem bloquear a resposta ao cliente.
-      if (name !== CATALOG_NAME) {
-        setImmediate(() => {
-          this.replicateFile(name, bytes, hashId).catch((error) => {
-            console.error(`[replicação] Erro ao replicar "${name}": ${error.message}`);
-          });
-        });
-      }
+      replicaNode = await this.replicateFile(name, bytes, hashId);
     } else {
-      await this.rpc(owner, '/rpc/files', {
+      const result = await this.rpc(owner, '/rpc/files', {
         method: 'PUT',
         body: { name, content: bytes.toString('base64'), hashId }
       });
+      replicaNode = result.replicaNode || null;
     }
 
     if (updateCatalog && name !== CATALOG_NAME) await this.addToCatalog(name);
-    return { name, hashId, node: owner, size: bytes.length };
+    return { name, hashId, node: owner, replicaNode, size: bytes.length };
   }
 
-  /** Busca os bytes de um arquivo a partir de qualquer nó da rede. */
+  /**
+   * Recupera um arquivo pelo Chord. Se o dono primário estiver inacessível,
+   * busca automaticamente a réplica no sucessor.
+   */
   async get(fileName) {
     this.assertJoined();
     const name = validateFileName(fileName);
     const hashId = hashKey(name);
     const owner = await this.findSuccessor(hashId);
-    let content;
 
-    if (owner.id === this.id) {
-      content = await this.readLocal(name);
-    } else {
-      const result = await this.rpc(owner, `/rpc/files?name=${encodeURIComponent(name)}`);
-      content = Buffer.from(result.content, 'base64');
+    try {
+      return await this._readFromNode(name, hashId, owner, 'primary', owner);
+    } catch (error) {
+      if (!shouldFallbackToReplica(error)) throw error;
+
+      if (await this.store.has(name)) {
+        const content = await this.store.read(name);
+        return this._fileResult(name, hashId, this.reference, content, {
+          source: this.store.isPrimary(name) ? 'primary' : 'replica',
+          owner
+        });
+      }
+
+      const replicaHolder = await this.findReplicaHolder(owner);
+      return this._readFromNode(name, hashId, replicaHolder, 'replica', owner);
     }
-    return { name, hashId, node: owner, size: content.length, content };
+  }
+
+  async _readFromNode(name, hashId, node, source, owner) {
+    if (node.id === this.id) {
+      const content = await this.readLocal(name);
+      return this._fileResult(name, hashId, this.reference, content, { source, owner });
+    }
+    const result = await this.rpc(node, `/rpc/files?name=${encodeURIComponent(name)}`);
+    const content = Buffer.from(result.content, 'base64');
+    return this._fileResult(name, hashId, node, content, {
+      source: result.source || source,
+      owner: owner || node
+    });
+  }
+
+  _fileResult(name, hashId, servedBy, content, { source, owner } = {}) {
+    return {
+      name,
+      hashId,
+      node: servedBy,
+      owner: owner || servedBy,
+      source: source || 'primary',
+      size: content.length,
+      content
+    };
+  }
+
+  async findReplicaHolder(owner) {
+    if (!owner || owner.id === this.id) {
+      return this.firstKnownSuccessor(new Set()) || this.reference;
+    }
+    try {
+      const result = await this.rpc(owner, '/rpc/successor', { timeout: 3000 });
+      if (result.node) return normalizeReference(result.node);
+    } catch (error) {
+      if (!isUnreachableError(error)) throw error;
+    }
+    return this.findSuccessor(add(owner.id, 1), 0, [owner.id]);
   }
 
   async addToCatalog(fileName) {
@@ -239,117 +313,67 @@ class ChordNode {
   }
 
   /**
-   * Grava bytes no diretório local do nó e registra metadados de replicação.
-   *
-   * @param {string} fileName - Nome do arquivo.
-   * @param {Buffer} content  - Conteúdo do arquivo.
-   * @param {{ isReplica?: boolean, primaryNodeId?: number|null, hashId?: number|null }} [opts]
-   *   `isReplica`: true indica que este é uma cópia do arquivo original.
-   *   `primaryNodeId`: id do nó que detém o arquivo primário.
-   *   `hashId`: hash/chave do arquivo no anel Chord.
+   * Grava bytes no diretório local do nó, separando primários e réplicas.
    */
   async storeLocal(fileName, content, { isReplica = false, primaryNodeId, hashId } = {}) {
     const name = validateFileName(fileName);
-    await fs.mkdir(this.storageDirectory, { recursive: true });
-    await fs.writeFile(path.join(this.storageDirectory, name), content);
-    // Registrar metadados; ignorar o próprio arquivo de metadados para evitar recursão.
-    if (name !== REPLICA_META_NAME) {
-      await this._withReplicaLock(async () => {
-        const meta = await this._readReplicaMeta();
-        meta[name] = {
-          hashId: hashId ?? null,
-          primaryNodeId: isReplica ? (primaryNodeId ?? null) : this.id,
-          isReplica: Boolean(isReplica)
-        };
-        await this._writeReplicaMeta(meta);
+    const bytes = Buffer.isBuffer(content) ? content : Buffer.from(content);
+    const key = hashId ?? hashKey(name);
+    if (isReplica) {
+      await this.store.writeReplica(name, bytes, {
+        hashId: key,
+        primaryNodeId: primaryNodeId ?? null
       });
+    } else {
+      await this.store.writePrimary(name, bytes, { hashId: key });
     }
   }
 
   async readLocal(fileName) {
     const name = validateFileName(fileName);
-    try {
-      return await fs.readFile(path.join(this.storageDirectory, name));
-    } catch (error) {
-      if (error.code === 'ENOENT') {
-        const notFound = new Error(`Arquivo "${name}" não encontrado na rede`);
-        notFound.code = 'ENOENT';
-        throw notFound;
-      }
-      throw error;
-    }
+    return this.store.read(name);
   }
 
-  // ─── Replicação ─────────────────────────────────────────────────────────────
-
-  /**
-   * Retorna os metadados de replicação de um arquivo armazenado localmente.
-   * Lança erro com code 'ENOENT' se o arquivo não estiver registrado em replicas.json.
-   *
-   * @param {string} fileName
-   * @returns {Promise<{ hashId: number|null, primaryNodeId: number|null, isReplica: boolean }>}
-   */
   async getReplicaMeta(fileName) {
     const name = validateFileName(fileName);
-    const meta = await this._readReplicaMeta();
-    if (!meta[name]) {
-      const notFound = new Error(`Arquivo "${name}" não encontrado na rede`);
-      notFound.code = 'ENOENT';
-      throw notFound;
-    }
-    return meta[name];
+    await this.store.ensureLoaded();
+    const meta = this.store.getMeta(name);
+    if (!meta) throw fileNotFound(name);
+    return {
+      hashId: meta.hashId ?? null,
+      primaryNodeId: meta.primaryNodeId ?? (this.store.isPrimary(name) ? this.id : null),
+      isReplica: this.store.isReplica(name)
+    };
   }
 
-  /**
-   * Retorna todos os arquivos primários (não réplicas) armazenados localmente,
-   * excluindo o catálogo e o próprio arquivo de metadados.
-   *
-   * @returns {Promise<Array<{ name: string, hashId: number|null }>>}
-   */
   async getAllPrimaryFiles() {
-    const meta = await this._readReplicaMeta();
-    return Object.entries(meta)
-      .filter(([name, info]) => !info.isReplica && name !== CATALOG_NAME)
-      .map(([name, info]) => ({ name, hashId: info.hashId }));
+    await this.store.ensureLoaded();
+    return this.store.listPrimary();
   }
 
   /**
-   * Retorna até REPLICA_COUNT nós únicos da Finger Table que não sejam o próprio nó,
-   * em ordem crescente de distância (finger[0] = sucessor imediato).
-   *
-   * @returns {Array<{ id: number, host: string, port: number }>}
+   * Até REPLICA_COUNT sucessores únicos (em geral o sucessor imediato).
    */
   getReplicationTargets() {
-    const seen = new Set([this.id]);
-    const targets = [];
-    for (const finger of this.fingers) {
-      if (targets.length >= REPLICA_COUNT) break;
-      const n = finger.node;
-      if (n && !seen.has(n.id)) {
-        seen.add(n.id);
-        targets.push(n);
-      }
-    }
-    return targets;
+    return this.getSuccessorList().slice(0, REPLICA_COUNT);
   }
 
   /**
-   * Garante que `fileName` está replicado nos nós alvo.
-   * Para cada nó, consulta `/rpc/replica-check` antes de transferir; só envia se ausente.
-   * Falhas individuais por nó são capturadas e logadas sem interromper os demais.
-   *
-   * @param {string} fileName
-   * @param {Buffer} content
-   * @param {number|null} hashId
+   * Envia a 2ª cópia obrigatória ao sucessor imediato. Falhas são logadas
+   * e não impedem que o primário já tenha sido gravado.
    */
   async replicateFile(fileName, content, hashId) {
     const targets = this.getReplicationTargets();
+    if (targets.length === 0) return null;
+
+    let replicaNode = null;
     for (const target of targets) {
       try {
         const check = await this.rpc(target,
           `/rpc/replica-check?name=${encodeURIComponent(fileName)}`);
         if (check.exists) {
           console.log(`[replicação] "${fileName}" já existe no nó ${target.id}, pulando.`);
+          replicaNode = target;
           continue;
         }
         await this.rpc(target, '/rpc/files', {
@@ -363,18 +387,15 @@ class ChordNode {
           }
         });
         console.log(`[replicação] "${fileName}" replicado com sucesso no nó ${target.id}.`);
+        replicaNode = target;
       } catch (error) {
         console.error(
           `[replicação] Falha ao replicar "${fileName}" no nó ${target.id}: ${error.message}`);
       }
     }
+    return replicaNode;
   }
 
-  /**
-   * Percorre todos os arquivos primários locais e garante que suas réplicas
-   * existam nos nós alvo atuais da Finger Table.
-   * Chamado automaticamente via setImmediate após cada atualização da Finger Table.
-   */
   async verifyReplicas() {
     if (!this.joined) return;
     let primaryFiles;
@@ -389,53 +410,20 @@ class ChordNode {
       try {
         content = await this.readLocal(file.name);
       } catch {
-        // Arquivo pode ter sido removido do disco; ignora silenciosamente.
         continue;
       }
       await this.replicateFile(file.name, content, file.hashId);
     }
   }
 
-  // ─── Infraestrutura de metadados de réplica ──────────────────────────────
-
-  /**
-   * Mutex via cadeia de Promises: serializa todas as leituras/escritas do replicas.json,
-   * evitando condições de corrida em operações concorrentes de armazenamento.
-   */
-  _withReplicaLock(fn) {
-    const next = this._replicaMetaLock.then(() => fn());
-    // Prevenir que rejeições de `fn` quebrem a cadeia para chamadas futuras.
-    this._replicaMetaLock = next.catch(() => {});
-    return next;
-  }
-
-  async _readReplicaMeta() {
-    const metaPath = path.join(this.storageDirectory, REPLICA_META_NAME);
-    try {
-      const data = await fs.readFile(metaPath, 'utf8');
-      return JSON.parse(data);
-    } catch (error) {
-      if (error.code === 'ENOENT') return {};
-      throw error;
-    }
-  }
-
-  async _writeReplicaMeta(meta) {
-    await fs.mkdir(this.storageDirectory, { recursive: true });
-    const metaPath = path.join(this.storageDirectory, REPLICA_META_NAME);
-    await fs.writeFile(metaPath, JSON.stringify(meta, null, 2));
-  }
-
-  // ─── Utilitários ─────────────────────────────────────────────────────────
-
   assertJoined() {
     if (!this.joined) throw new Error('O nó ainda não entrou em uma rede');
   }
 
-  async rpc(node, path, { method = 'GET', body } = {}) {
+  async rpc(node, path, { method = 'GET', body, timeout } = {}) {
     const target = normalizeReference(node);
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.requestTimeout);
+    const timer = setTimeout(() => controller.abort(), timeout ?? this.requestTimeout);
     try {
       const response = await fetch(`http://${target.host}:${target.port}${path}`, {
         method,
@@ -444,14 +432,26 @@ class ChordNode {
         signal: controller.signal
       });
       const data = await response.json();
-      if (!response.ok) throw new Error(data.error || `Erro HTTP ${response.status}`);
+      if (!response.ok) {
+        const error = new Error(data.error || `Erro HTTP ${response.status}`);
+        error.code = data.code;
+        error.status = response.status;
+        throw error;
+      }
       return data;
     } catch (error) {
       if (error.name === 'AbortError') {
-        const timeout = new Error(
+        const timeoutError = new Error(
           `Tempo limite ao acessar o nó ${target.id} em ${target.host}:${target.port}`);
-        timeout.code = 'ETIMEDOUT';
-        throw timeout;
+        timeoutError.code = 'ETIMEDOUT';
+        throw timeoutError;
+      }
+      if (isUnreachableError(error) && error.code !== 'ETIMEDOUT') {
+        const unreachable = new Error(
+          `Nó ${target.id} inacessível em ${target.host}:${target.port}`);
+        unreachable.code = 'ECONNREFUSED';
+        unreachable.cause = error;
+        throw unreachable;
       }
       throw error;
     } finally {
@@ -465,9 +465,57 @@ class ChordNode {
       joined: this.joined,
       predecessor: this.predecessor,
       successor: this.successor,
-      fingerTable: this.fingers
+      successors: this.getSuccessorList(),
+      fingerTable: this.fingers,
+      primaryFiles: this.store.listPrimary(),
+      replicaFiles: this.store.listReplica()
     };
   }
+
+  async nodeStatus() {
+    await this.store.ensureLoaded();
+    return {
+      id: this.id,
+      host: this.host,
+      port: this.port,
+      joined: this.joined,
+      predecessor: this.predecessor,
+      successor: this.successor,
+      successors: this.getSuccessorList(),
+      primaryFiles: this.store.listPrimary().map((file) => ({
+        name: file.name,
+        hashId: file.hashId,
+        size: file.size
+      })),
+      replicaFiles: this.store.listReplica().map((file) => ({
+        name: file.name,
+        hashId: file.hashId,
+        size: file.size,
+        primaryNodeId: file.primaryNodeId ?? null
+      }))
+    };
+  }
+}
+
+function shouldFallbackToReplica(error) {
+  return isUnreachableError(error)
+    || error.code === 'ENOENT'
+    || error.status === 404
+    || /não encontrado/i.test(error.message || '');
+}
+
+function isUnreachableError(error) {
+  if (!error) return false;
+  if (error.code === 'ETIMEDOUT' || error.code === 'ECONNREFUSED' || error.code === 'ECONNRESET') {
+    return true;
+  }
+  if (error.name === 'AbortError') return true;
+  if (error.name === 'TypeError' && /fetch failed/i.test(String(error.message || ''))) return true;
+  const message = String(error.message || '');
+  if (/Tempo limite|inacessível|fetch failed|ECONNREFUSED|ECONNRESET|network/i.test(message)) {
+    return true;
+  }
+  return isUnreachableError(error.cause);
 }
 
 function validateFileName(fileName) {
@@ -496,5 +544,5 @@ module.exports = {
   normalizeReference,
   validateFileName,
   CATALOG_NAME,
-  REPLICA_META_NAME
+  REPLICA_COUNT
 };
