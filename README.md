@@ -1,8 +1,9 @@
 # Chord em Node.js
 
 Implementação didática de um anel Chord com espaço fixo de identificadores `1..32`
-(`m = 5`). Cada nó mantém cinco entradas na finger table e oferece a operação
-`join` por HTTP. Requer Node.js 18 ou superior e não usa pacotes externos.
+(`m = 5`). Cada nó mantém cinco entradas na finger table e oferece entrada e
+saída controladas por HTTP. Requer Node.js 18 ou superior e não usa pacotes
+externos.
 
 ## Executar
 
@@ -63,6 +64,33 @@ Ao receber `POST /join`, o nó:
 4. calcula as cinco entradas para `n + 1`, `n + 2`, `n + 4`, `n + 8` e `n + 16`.
 5. percorre o anel para atualizar as finger tables dos demais nós.
 
+## Saída controlada
+
+No painel controlador, use **Sair da rede** para retirar um nó local. Pela API,
+envie `DELETE` para a porta do nó no controlador:
+
+```bash
+curl -X DELETE http://127.0.0.1:5000/api/nodes/5002
+```
+
+Antes de fechar o servidor, o nó:
+
+1. transfere seus arquivos primários, inclusive `catalogo.txt`, ao sucessor;
+2. faz o predecessor apontar para o sucessor e vice-versa;
+3. percorre o anel e aguarda a atualização das finger tables;
+4. sincroniza novamente os arquivos que possam ter mudado durante a saída;
+5. fecha o servidor somente depois da conclusão dessas etapas.
+
+Se a transferência ou a religação falhar, o nó permanece aberto e registrado
+no painel. Ao encerrar `npm start` com `Ctrl+C`, o controlador tenta retirar os
+nós locais sequencialmente antes de fechar.
+
+Fechar uma aba do navegador não retira o nó da rede. Todos os nós criados por
+um painel são servidores lógicos no mesmo processo Node.js; portanto, encerrar
+esse processo à força encerra todos eles. Quedas abruptas de processo, máquina
+ou conexão ainda não são recuperadas automaticamente: essa tolerância exige
+estabilização periódica, detecção de falhas e uma lista de sucessores.
+
 Execute os testes com:
 
 ```bash
@@ -84,6 +112,19 @@ console.log(arquivo.content.toString());
 
 Todo `put` também atualiza `catalogo.txt` (um nome por linha). O catálogo usa o
 mesmo hash e é armazenado na própria rede. Pela API HTTP de qualquer nó:
+
+O retorno do upload informa `primary`, `replicas` e `locations`. A gravação é
+confirmada somente depois da tentativa de criar até duas réplicas nos sucessores
+imediatos. A interface mostra o ID e o endereço de cada nó que confirmou uma
+cópia. Para consultar novamente as localizações:
+
+```bash
+curl 'http://127.0.0.1:5001/api/files/locations?name=trabalho.txt'
+```
+
+Durante o download, se o nó primário não entregar o arquivo, o nó consultado
+percorre as referências conhecidas e usa uma réplica disponível. Na saída
+controlada, o primário também é promovido no sucessor antes de o servidor fechar.
 
 ```bash
 curl -X POST http://127.0.0.1:5001/api/files \

@@ -49,7 +49,11 @@ async function loadNodes() {
           <span>${nodeAddress(state.node)}</span>
         </div>
         <div class="node-links"><span>← ${predecessor}</span><span>${successor} →</span></div>
-        <a class="button secondary" href="http://${nodeAddress(state.node)}">Abrir painel</a>`;
+        <div class="node-actions">
+          <a class="button secondary" href="http://${nodeAddress(state.node)}">Abrir painel</a>
+          <button class="button danger" type="button" data-leave-port="${state.node.port}"
+            data-leave-id="${state.node.id}">Sair da rede</button>
+        </div>`;
       return card;
     }));
   } catch (error) {
@@ -94,6 +98,29 @@ form.addEventListener('submit', async (event) => {
 });
 
 document.querySelector('#refresh-button').addEventListener('click', loadNodes);
+list.addEventListener('click', async (event) => {
+  const leaveButton = event.target.closest('[data-leave-port]');
+  if (!leaveButton) return;
+  const { leavePort, leaveId } = leaveButton.dataset;
+  if (!window.confirm(`Retirar o nó ${leaveId} da rede?`)) return;
+
+  leaveButton.disabled = true;
+  message.className = 'form-message';
+  message.textContent = `Retirando o nó ${leaveId}…`;
+  try {
+    const response = await fetch(`/api/nodes/${encodeURIComponent(leavePort)}`, {
+      method: 'DELETE'
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || 'Não foi possível retirar o nó');
+    message.textContent = `Nó ${leaveId} retirado da rede com sucesso.`;
+    await loadNodes();
+  } catch (error) {
+    message.className = 'form-message error';
+    message.textContent = error.message;
+    leaveButton.disabled = false;
+  }
+});
 fillNetworkDefaults();
 loadNodes();
 setInterval(loadNodes, 5000);

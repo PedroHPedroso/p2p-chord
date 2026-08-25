@@ -26,8 +26,10 @@ async function startNodeServer(options) {
   return {
     node,
     server,
-    close: () => new Promise((resolve, reject) =>
-      server.close((error) => error ? reject(error) : resolve()))
+    close: () => new Promise((resolve, reject) => {
+      if (!server.listening) return resolve();
+      server.close((error) => error ? reject(error) : resolve());
+    })
   };
 }
 
@@ -52,13 +54,17 @@ async function handleNodeRequest(node, request, response) {
       const content = Buffer.from(body.content || '', body.encoding === 'base64' ? 'base64' : 'utf8');
       return json(response, 201, await node.put(body.name, content));
     }
+    if (request.method === 'GET' && url.pathname === '/api/files/locations') {
+      return json(response, 200, await node.locateFile(url.searchParams.get('name')));
+    }
     if (request.method === 'GET' && url.pathname === '/api/files') {
       const result = await node.get(url.searchParams.get('name'));
       response.writeHead(200, {
         'content-type': 'application/octet-stream',
         'content-disposition': `attachment; filename="${encodeURIComponent(result.name)}"`,
         'x-chord-hash-id': String(result.hashId),
-        'x-chord-node-id': String(result.node.id)
+        'x-chord-node-id': String(result.node.id),
+        'x-chord-copy-role': result.isReplica ? 'replica' : 'primary'
       });
       return response.end(result.content);
     }
@@ -74,17 +80,29 @@ async function handleNodeRequest(node, request, response) {
       return json(response, 200, { node: node.predecessor });
     }
     if (request.method === 'PUT' && url.pathname === '/rpc/predecessor') {
-      node.predecessor = normalizeReference((await readJson(request)).node);
+      const body = await readJson(request);
+      assertExpectedNeighbor(node.predecessor, body.expectedId, 'predecessor');
+      node.predecessor = normalizeReference(body.node);
       return json(response, 200, { ok: true });
     }
     if (request.method === 'PUT' && url.pathname === '/rpc/successor') {
-      node.successor = normalizeReference((await readJson(request)).node);
+      const body = await readJson(request);
+      assertExpectedNeighbor(node.successor, body.expectedId, 'sucessor');
+      node.successor = normalizeReference(body.node);
       return json(response, 200, { ok: true });
+    }
+    if (request.method === 'GET' && url.pathname === '/rpc/successor') {
+      return json(response, 200, { node: node.successor });
     }
     if (request.method === 'POST' && url.pathname === '/rpc/refresh-fingers') {
       const body = await readJson(request);
       return json(response, 200,
         await node.refreshRingFingerTables(body.originId, body.hops || 0));
+    }
+    if (request.method === 'POST' && url.pathname === '/rpc/repair-fingers') {
+      const body = await readJson(request);
+      return json(response, 200,
+        await node.repairRingFingerTables(body.originId, body.hops || 0));
     }
     if (request.method === 'PUT' && url.pathname === '/rpc/files') {
       const body = await readJson(request);
@@ -95,20 +113,27 @@ async function handleNodeRequest(node, request, response) {
         primaryNodeId: body.primaryNodeId ?? null,
         hashId: body.hashId ?? null
       });
-      // Se o arquivo armazenado é primário, replicar para os próprios sucessores em background.
-      if (!isReplica && body.name !== CATALOG_NAME) {
-        setImmediate(() => {
-          node.replicateFile(body.name, content, body.hashId ?? null).catch((error) => {
-            console.error(`[replicação] Erro ao replicar "${body.name}": ${error.message}`);
-          });
-        });
-      }
-      return json(response, 200, { ok: true, size: content.length });
+      const replicas = !isReplica && body.replicate !== false
+        ? await node.replicateFile(body.name, content, body.hashId ?? null)
+        : [];
+      const meta = await node.getReplicaMeta(body.name);
+      return json(response, 200, {
+        ok: true,
+        size: content.length,
+        isReplica: meta.isReplica,
+        replicas
+      });
     }
     if (request.method === 'GET' && url.pathname === '/rpc/files') {
       const name = url.searchParams.get('name');
       const content = await node.readLocal(name);
-      return json(response, 200, { name, content: content.toString('base64') });
+      const meta = await node.getReplicaMeta(name);
+      return json(response, 200, {
+        name,
+        content: content.toString('base64'),
+        isReplica: meta.isReplica,
+        primaryNodeId: meta.primaryNodeId
+      });
     }
     // Verifica se uma réplica existe antes de transferi-la, evitando envios desnecessários.
     if (request.method === 'GET' && url.pathname === '/rpc/replica-check') {
@@ -125,10 +150,20 @@ async function handleNodeRequest(node, request, response) {
     }
     return json(response, 404, { error: 'Rota não encontrada' });
   } catch (error) {
-    const status = error.name === 'AbortError' || error.code === 'ETIMEDOUT'
-      ? 504 : error.code === 'ENOENT' ? 404 : 400;
+    const status = error.status || (error.name === 'AbortError' || error.code === 'ETIMEDOUT'
+      ? 504 : error.code === 'ENOENT' ? 404
+        : error.code === 'ESTALE_TOPOLOGY' || error.code === 'ELEAVEINPROGRESS' ? 409 : 400);
     return json(response, status, { error: error.message });
   }
+}
+
+function assertExpectedNeighbor(current, expectedId, label) {
+  if (expectedId === undefined || expectedId === null) return;
+  if (current?.id === Number(expectedId)) return;
+  const conflict = new Error(
+    `O ${label} mudou: esperado ${expectedId}, atual ${current?.id ?? 'nenhum'}`);
+  conflict.code = 'ESTALE_TOPOLOGY';
+  throw conflict;
 }
 
 function json(response, status, value) {
