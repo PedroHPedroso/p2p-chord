@@ -68,6 +68,7 @@ const server = http.createServer(async (request, response) => {
       if (!port) throw new Error('Parâmetro "port" é obrigatório');
       const running = nodes.get(port);
       if (!running) throw new Error(`Nenhum nó local encontrado na porta ${port}`);
+      await running.node.leave();
       await running.close();
       nodes.delete(port);
       return json(response, 200, { ok: true, port });

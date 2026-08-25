@@ -64,6 +64,11 @@ class ChordNode {
 
   async join(bootstrap) {
     if (this.joined) throw new Error('Este nó já pertence a uma rede Chord');
+
+    // Limpa resíduos de estado de um join anterior para permitir reconexão limpa.
+    this.predecessor = null;
+    this.fingers = this.buildEmptyFingerTable();
+
     if (!bootstrap) {
       this.createRing();
       return this.state();
@@ -109,6 +114,88 @@ class ChordNode {
       body: { originId: this.id, hops: 0 }
     });
     return this.state();
+  }
+
+  /**
+   * Saída graciosa do anel Chord:
+   * 1. Transfere todos os arquivos primários para o sucessor (como primários).
+   * 2. Ajusta os ponteiros do predecessor e do sucessor para se conectarem diretamente.
+   * 3. Dispara a atualização das finger tables no restante do anel.
+   * 4. Reseta o estado local para permitir um futuro join() limpo.
+   */
+  async leave() {
+    if (!this.joined) return;
+
+    const successor = this.successor;
+    const predecessor = this.predecessor;
+    const isSoleNode = !successor || successor.id === this.id;
+
+    // ── 1. Handoff de arquivos primários ────────────────────────────────────
+    if (!isSoleNode) {
+      await this.store.ensureLoaded();
+      const primaryFiles = this.store.listPrimary();
+      for (const file of primaryFiles) {
+        let content;
+        try {
+          content = await this.readLocal(file.name);
+        } catch (error) {
+          console.error(`[leave] Não foi possível ler "${file.name}": ${error.message}`);
+          continue;
+        }
+        try {
+          await this.rpc(successor, '/rpc/files', {
+            method: 'PUT',
+            body: {
+              name: file.name,
+              content: content.toString('base64'),
+              isReplica: false,
+              primaryNodeId: successor.id,
+              hashId: file.hashId ?? null
+            }
+          });
+          console.log(`[leave] "${file.name}" transferido para o nó ${successor.id}.`);
+        } catch (error) {
+          console.error(`[leave] Falha ao transferir "${file.name}" para o nó ${successor.id}: ${error.message}`);
+        }
+      }
+    }
+
+    // ── 2. Reajuste de ponteiros do anel ────────────────────────────────────
+    if (!isSoleNode && predecessor && successor) {
+      // Predecessor deve apontar seu sucessor para o nosso sucessor.
+      try {
+        await this.rpc(predecessor, '/rpc/successor', {
+          method: 'PUT',
+          body: { node: successor }
+        });
+      } catch (error) {
+        console.error(`[leave] Falha ao atualizar sucessor do predecessor (nó ${predecessor.id}): ${error.message}`);
+      }
+      // Sucessor deve apontar seu predecessor para o nosso predecessor.
+      try {
+        await this.rpc(successor, '/rpc/predecessor', {
+          method: 'PUT',
+          body: { node: predecessor }
+        });
+      } catch (error) {
+        console.error(`[leave] Falha ao atualizar predecessor do sucessor (nó ${successor.id}): ${error.message}`);
+      }
+
+      // ── 3. Propaga atualização de finger tables no anel ─────────────────
+      try {
+        await this.rpc(successor, '/rpc/refresh-fingers', {
+          method: 'POST',
+          body: { originId: successor.id, hops: 0 }
+        });
+      } catch (error) {
+        console.error(`[leave] Falha ao propagar refresh de fingers: ${error.message}`);
+      }
+    }
+
+    // ── 4. Reset do estado local ─────────────────────────────────────────────
+    this.joined = false;
+    this.predecessor = null;
+    this.fingers = this.buildEmptyFingerTable();
   }
 
   async refreshFingerTable() {
