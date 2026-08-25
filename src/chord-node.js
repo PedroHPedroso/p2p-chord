@@ -157,7 +157,9 @@ class ChordNode {
 
     if (!this._leaveDetached) {
       try {
-        await this._withPrimaryWriteLock(() => this._transferPrimaryFiles(successor));
+        await this._withPrimaryWriteLock(() => this._transferPrimaryFiles(successor, {
+          replicate: false
+        }));
       } catch (error) {
         this._resetLeaveState();
         throw error;
@@ -312,25 +314,33 @@ class ChordNode {
     const hashId = hashKey(name);
     const owner = await this.findSuccessor(hashId);
 
+    let replicas = [];
     if (owner.id === this.id) {
       await this.storeLocal(name, bytes, { isReplica: false, primaryNodeId: this.id, hashId });
-      // Replicar para os sucessores em background, sem bloquear a resposta ao cliente.
-      if (name !== CATALOG_NAME) {
-        setImmediate(() => {
-          this.replicateFile(name, bytes, hashId).catch((error) => {
-            console.error(`[replicação] Erro ao replicar "${name}": ${error.message}`);
-          });
-        });
-      }
+      // O upload só é confirmado depois das cópias: assim o cliente recebe
+      // exatamente os nós que efetivamente armazenaram o arquivo.
+      replicas = await this.replicateFile(name, bytes, hashId);
     } else {
-      await this.rpc(owner, '/rpc/files', {
+      const stored = await this.rpc(owner, '/rpc/files', {
         method: 'PUT',
         body: { name, content: bytes.toString('base64'), hashId }
       });
+      replicas = stored.replicas || [];
     }
 
     if (updateCatalog && name !== CATALOG_NAME) await this.addToCatalog(name);
-    return { name, hashId, node: owner, size: bytes.length };
+    return {
+      name,
+      hashId,
+      node: owner,
+      primary: owner,
+      replicas,
+      locations: [
+        { ...owner, role: 'primary' },
+        ...replicas.map((replica) => ({ ...replica, role: 'replica' }))
+      ],
+      size: bytes.length
+    };
   }
 
   /** Busca os bytes de um arquivo a partir de qualquer nó da rede. */
@@ -338,16 +348,70 @@ class ChordNode {
     this.assertJoined();
     const name = validateFileName(fileName);
     const hashId = hashKey(name);
-    const owner = await this.findSuccessor(hashId);
-    let content;
-
-    if (owner.id === this.id) {
-      content = await this.readLocal(name);
-    } else {
+    let owner = null;
+    try {
+      owner = await this.findSuccessor(hashId);
+      if (owner.id === this.id) {
+        const content = await this.readLocal(name);
+        const meta = await this.getReplicaMeta(name);
+        return { name, hashId, node: this.reference, primary: owner,
+          isReplica: meta.isReplica,
+          size: content.length, content };
+      }
       const result = await this.rpc(owner, `/rpc/files?name=${encodeURIComponent(name)}`);
-      content = Buffer.from(result.content, 'base64');
+      const content = Buffer.from(result.content, 'base64');
+      return { name, hashId, node: owner, primary: owner,
+        isReplica: Boolean(result.isReplica), size: content.length, content };
+    } catch (error) {
+      // O primário pode ter saído ou estar temporariamente inacessível. As
+      // referências conhecidas permitem localizar uma das cópias sobreviventes.
+      const recovered = await this._getFromKnownCopies(name);
+      if (recovered) {
+        return { name, hashId, node: recovered.node, primary: owner,
+          isReplica: recovered.isReplica, size: recovered.content.length,
+          content: recovered.content };
+      }
+      throw error;
     }
-    return { name, hashId, node: owner, size: content.length, content };
+  }
+
+  async _getFromKnownCopies(name) {
+    const queue = [this.reference, this.predecessor, this.successor,
+      ...this.fingers.map((finger) => finger.node)].filter(Boolean);
+    const visited = new Set();
+
+    while (queue.length && visited.size < 32) {
+      const candidate = queue.shift();
+      if (!candidate || visited.has(candidate.id)) continue;
+      visited.add(candidate.id);
+
+      try {
+        if (candidate.id === this.id) {
+          const content = await this.readLocal(name);
+          const meta = await this.getReplicaMeta(name);
+          return { node: this.reference, isReplica: meta.isReplica, content };
+        }
+        const result = await this.rpc(candidate,
+          `/rpc/files?name=${encodeURIComponent(name)}`);
+        return {
+          node: candidate,
+          isReplica: Boolean(result.isReplica),
+          content: Buffer.from(result.content, 'base64')
+        };
+      } catch {
+        // Mesmo sem o arquivo, um nó acessível pode revelar outras rotas.
+        if (candidate.id !== this.id) {
+          try {
+            const state = await this.rpc(candidate, '/api/state');
+            queue.push(state.predecessor, state.successor,
+              ...state.fingerTable.map((finger) => finger.node));
+          } catch {
+            // Nó indisponível; prossegue pelas demais referências conhecidas.
+          }
+        }
+      }
+    }
+    return null;
   }
 
   async addToCatalog(fileName) {
@@ -461,7 +525,7 @@ class ChordNode {
       .map(([name, info]) => ({ name, hashId: info.hashId }));
   }
 
-  async _transferPrimaryFiles(successor) {
+  async _transferPrimaryFiles(successor, { replicate = true } = {}) {
     const files = await this.getAllPrimaryFiles({ includeCatalog: true });
     for (const file of files) {
       const content = await this.readLocal(file.name);
@@ -471,7 +535,8 @@ class ChordNode {
           name: file.name,
           content: content.toString('base64'),
           isReplica: false,
-          hashId: file.hashId
+          hashId: file.hashId,
+          replicate
         }
       });
     }
@@ -485,7 +550,8 @@ class ChordNode {
         name,
         content: content.toString('base64'),
         isReplica: false,
-        hashId: hashId ?? null
+        hashId: hashId ?? null,
+        replicate: false
       }
     });
   }
@@ -496,15 +562,20 @@ class ChordNode {
    *
    * @returns {Array<{ id: number, host: string, port: number }>}
    */
-  getReplicationTargets() {
+  async getReplicationTargets() {
     const seen = new Set([this.id]);
     const targets = [];
-    for (const finger of this.fingers) {
+    let next = this.successor;
+    while (next && !seen.has(next.id) && targets.length < REPLICA_COUNT) {
+      seen.add(next.id);
+      targets.push(next);
       if (targets.length >= REPLICA_COUNT) break;
-      const n = finger.node;
-      if (n && !seen.has(n.id)) {
-        seen.add(n.id);
-        targets.push(n);
+      try {
+        const result = await this.rpc(next, '/rpc/successor');
+        next = result.node;
+      } catch (error) {
+        console.error(`[replicação] Não foi possível consultar o sucessor do nó ${next.id}: ${error.message}`);
+        break;
       }
     }
     return targets;
@@ -520,16 +591,11 @@ class ChordNode {
    * @param {number|null} hashId
    */
   async replicateFile(fileName, content, hashId) {
-    const targets = this.getReplicationTargets();
+    const targets = await this.getReplicationTargets();
+    const replicas = [];
     for (const target of targets) {
       try {
-        const check = await this.rpc(target,
-          `/rpc/replica-check?name=${encodeURIComponent(fileName)}`);
-        if (check.exists) {
-          console.log(`[replicação] "${fileName}" já existe no nó ${target.id}, pulando.`);
-          continue;
-        }
-        await this.rpc(target, '/rpc/files', {
+        const stored = await this.rpc(target, '/rpc/files', {
           method: 'PUT',
           body: {
             name: fileName,
@@ -539,12 +605,49 @@ class ChordNode {
             hashId
           }
         });
+        if (stored.isReplica !== false) replicas.push(target);
         console.log(`[replicação] "${fileName}" replicado com sucesso no nó ${target.id}.`);
       } catch (error) {
         console.error(
           `[replicação] Falha ao replicar "${fileName}" no nó ${target.id}: ${error.message}`);
       }
     }
+    return replicas;
+  }
+
+  /** Lista todas as cópias confirmadas percorrendo o anel a partir deste nó. */
+  async locateFile(fileName) {
+    const name = validateFileName(fileName);
+    const locations = [];
+    const visited = new Set();
+    let current = this.reference;
+
+    while (current && !visited.has(current.id) && visited.size < 32) {
+      visited.add(current.id);
+      try {
+        let check;
+        if (current.id === this.id) {
+          const meta = await this.getReplicaMeta(name);
+          check = { exists: true, ...meta };
+        } else {
+          check = await this.rpc(current,
+            `/rpc/replica-check?name=${encodeURIComponent(name)}`);
+        }
+        if (check.exists) {
+          locations.push({ ...current, role: check.isReplica ? 'replica' : 'primary' });
+        }
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+      }
+
+      if (current.id === this.id) {
+        current = this.successor;
+      } else {
+        const result = await this.rpc(current, '/rpc/successor');
+        current = result.node;
+      }
+    }
+    return { name, hashId: hashKey(name), locations };
   }
 
   /**

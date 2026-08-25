@@ -54,13 +54,17 @@ async function handleNodeRequest(node, request, response) {
       const content = Buffer.from(body.content || '', body.encoding === 'base64' ? 'base64' : 'utf8');
       return json(response, 201, await node.put(body.name, content));
     }
+    if (request.method === 'GET' && url.pathname === '/api/files/locations') {
+      return json(response, 200, await node.locateFile(url.searchParams.get('name')));
+    }
     if (request.method === 'GET' && url.pathname === '/api/files') {
       const result = await node.get(url.searchParams.get('name'));
       response.writeHead(200, {
         'content-type': 'application/octet-stream',
         'content-disposition': `attachment; filename="${encodeURIComponent(result.name)}"`,
         'x-chord-hash-id': String(result.hashId),
-        'x-chord-node-id': String(result.node.id)
+        'x-chord-node-id': String(result.node.id),
+        'x-chord-copy-role': result.isReplica ? 'replica' : 'primary'
       });
       return response.end(result.content);
     }
@@ -87,6 +91,9 @@ async function handleNodeRequest(node, request, response) {
       node.successor = normalizeReference(body.node);
       return json(response, 200, { ok: true });
     }
+    if (request.method === 'GET' && url.pathname === '/rpc/successor') {
+      return json(response, 200, { node: node.successor });
+    }
     if (request.method === 'POST' && url.pathname === '/rpc/refresh-fingers') {
       const body = await readJson(request);
       return json(response, 200,
@@ -106,20 +113,27 @@ async function handleNodeRequest(node, request, response) {
         primaryNodeId: body.primaryNodeId ?? null,
         hashId: body.hashId ?? null
       });
-      // Se o arquivo armazenado é primário, replicar para os próprios sucessores em background.
-      if (!isReplica && body.name !== CATALOG_NAME) {
-        setImmediate(() => {
-          node.replicateFile(body.name, content, body.hashId ?? null).catch((error) => {
-            console.error(`[replicação] Erro ao replicar "${body.name}": ${error.message}`);
-          });
-        });
-      }
-      return json(response, 200, { ok: true, size: content.length });
+      const replicas = !isReplica && body.replicate !== false
+        ? await node.replicateFile(body.name, content, body.hashId ?? null)
+        : [];
+      const meta = await node.getReplicaMeta(body.name);
+      return json(response, 200, {
+        ok: true,
+        size: content.length,
+        isReplica: meta.isReplica,
+        replicas
+      });
     }
     if (request.method === 'GET' && url.pathname === '/rpc/files') {
       const name = url.searchParams.get('name');
       const content = await node.readLocal(name);
-      return json(response, 200, { name, content: content.toString('base64') });
+      const meta = await node.getReplicaMeta(name);
+      return json(response, 200, {
+        name,
+        content: content.toString('base64'),
+        isReplica: meta.isReplica,
+        primaryNodeId: meta.primaryNodeId
+      });
     }
     // Verifica se uma réplica existe antes de transferi-la, evitando envios desnecessários.
     if (request.method === 'GET' && url.pathname === '/rpc/replica-check') {

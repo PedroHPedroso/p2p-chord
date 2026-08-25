@@ -97,6 +97,60 @@ test('posição sem nó armazena no próximo nó ativo através de HTTP', async 
   assert.match((await second.node.get('catalogo.txt')).content.toString(), new RegExp(name));
 });
 
+test('upload confirma o nó primário e as réplicas nos sucessores imediatos', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'chord-replica-locations-'));
+  const running = await startRing([8, 20, 28], directory);
+  t.after(async () => {
+    await Promise.allSettled(running.map((entry) => entry.close()));
+    await fs.rm(directory, { recursive: true, force: true });
+  });
+
+  const name = findNameInInterval('replicas', 8, 20);
+  const bytes = Buffer.from('três cópias confirmadas');
+  const stored = await running[0].node.put(name, bytes);
+
+  assert.equal(stored.primary.id, 20);
+  assert.deepEqual(stored.replicas.map((node) => node.id), [28, 8]);
+  assert.deepEqual(stored.locations.map(({ id, role }) => ({ id, role })), [
+    { id: 20, role: 'primary' },
+    { id: 28, role: 'replica' },
+    { id: 8, role: 'replica' }
+  ]);
+  for (const entry of running) assert.deepEqual(await entry.node.readLocal(name), bytes);
+
+  const locationsResponse = await fetch(
+    `http://127.0.0.1:${running[0].node.port}/api/files/locations?name=${encodeURIComponent(name)}`);
+  assert.equal(locationsResponse.status, 200);
+  const located = await locationsResponse.json();
+  assert.deepEqual(located.locations.map(({ id, role }) => ({ id, role })), [
+    { id: 8, role: 'replica' },
+    { id: 20, role: 'primary' },
+    { id: 28, role: 'replica' }
+  ]);
+});
+
+test('download usa uma réplica quando o nó primário fica offline abruptamente', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'chord-replica-fallback-'));
+  const running = await startRing([8, 20, 28], directory);
+  t.after(async () => {
+    await Promise.allSettled(running.map((entry) => entry.close()));
+    await fs.rm(directory, { recursive: true, force: true });
+  });
+
+  const name = findNameInInterval('fallback', 8, 20);
+  const bytes = Buffer.from('disponível enquanto houver uma cópia online');
+  const stored = await running[0].node.put(name, bytes);
+  assert.equal(stored.primary.id, 20);
+
+  await running[1].close();
+  const response = await fetch(
+    `http://127.0.0.1:${running[0].node.port}/api/files?name=${encodeURIComponent(name)}`);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('x-chord-node-id'), '8');
+  assert.equal(response.headers.get('x-chord-copy-role'), 'replica');
+  assert.deepEqual(Buffer.from(await response.arrayBuffer()), bytes);
+});
+
 test('saída controlada religa os vizinhos e remove o nó das finger tables', async (t) => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'chord-leave-ring-'));
   const running = await startRing([8, 20, 28], directory);
@@ -248,6 +302,15 @@ async function startRing(ids, directory) {
     running.push(entry);
   }
   return running;
+}
+
+function findNameInInterval(prefix, lowerExclusive, upperInclusive) {
+  for (let index = 0; index < 1000; index += 1) {
+    const candidate = `${prefix}-${index}.bin`;
+    const position = hashKey(candidate);
+    if (position > lowerExclusive && position <= upperInclusive) return candidate;
+  }
+  throw new Error('Não foi possível encontrar um nome no intervalo solicitado');
 }
 
 async function freePort() {

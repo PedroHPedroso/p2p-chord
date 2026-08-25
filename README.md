@@ -113,6 +113,19 @@ console.log(arquivo.content.toString());
 Todo `put` também atualiza `catalogo.txt` (um nome por linha). O catálogo usa o
 mesmo hash e é armazenado na própria rede. Pela API HTTP de qualquer nó:
 
+O retorno do upload informa `primary`, `replicas` e `locations`. A gravação é
+confirmada somente depois da tentativa de criar até duas réplicas nos sucessores
+imediatos. A interface mostra o ID e o endereço de cada nó que confirmou uma
+cópia. Para consultar novamente as localizações:
+
+```bash
+curl 'http://127.0.0.1:5001/api/files/locations?name=trabalho.txt'
+```
+
+Durante o download, se o nó primário não entregar o arquivo, o nó consultado
+percorre as referências conhecidas e usa uma réplica disponível. Na saída
+controlada, o primário também é promovido no sucessor antes de o servidor fechar.
+
 ```bash
 curl -X POST http://127.0.0.1:5001/api/files \
   -H 'content-type: application/json' \
