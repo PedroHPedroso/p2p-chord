@@ -63,6 +63,15 @@ const server = http.createServer(async (request, response) => {
         throw error;
       }
     }
+    if (request.method === 'DELETE' && url.pathname === '/api/nodes') {
+      const port = Number(url.searchParams.get('port'));
+      if (!port) throw new Error('Parâmetro "port" é obrigatório');
+      const running = nodes.get(port);
+      if (!running) throw new Error(`Nenhum nó local encontrado na porta ${port}`);
+      await running.close();
+      nodes.delete(port);
+      return json(response, 200, { ok: true, port });
+    }
     return json(response, 404, { error: 'Rota não encontrada' });
   } catch (error) {
     return json(response, 400, { error: error.message });

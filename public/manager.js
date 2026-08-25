@@ -53,6 +53,21 @@ async function loadNodes() {
         <div class="node-links"><span>← ${predecessor}</span><span>${successor} →</span></div>
         <div class="node-files">${primaryCount} primários · ${replicaCount} réplicas</div>
         <a class="button secondary" href="http://${nodeAddress(state.node)}">Abrir painel</a>`;
+      card.addEventListener('click', async (event) => {
+        if (!event.shiftKey) return;
+        const { port } = state.node;
+        if (!confirm(`Forçar saída do nó ${state.node.id} (porta ${port})?`)) return;
+        try {
+          const res = await fetch(`/api/nodes?port=${port}`, { method: 'DELETE' });
+          if (!res.ok) {
+            const { error } = await res.json();
+            throw new Error(error);
+          }
+          await loadNodes();
+        } catch (err) {
+          alert(`Erro ao remover nó: ${err.message}`);
+        }
+      });
       return card;
     }));
   } catch (error) {
