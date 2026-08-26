@@ -124,6 +124,16 @@ td:first-child { color: var(--muted); }
 .trace-location.primary { border-color: #2d6652; }
 .trace-location strong, .trace-location small { display: block; }
 .trace-location small { color: var(--muted); }
+.trace-path { display: grid; gap: 7px; }
+.path-hop { display: grid; grid-template-columns: 25px minmax(0, 1fr); gap: 9px; align-items: stretch; }
+.path-order { position: relative; display: grid; place-items: center; align-self: start; width: 25px; height: 25px; color: #07110d; background: var(--accent); border-radius: 50%; font-size: 11px; font-weight: 900; }
+.path-hop:not(:last-child) .path-order::after { content: ""; position: absolute; top: 25px; left: 12px; width: 1px; height: 44px; background: var(--border); }
+.path-movement { min-width: 0; padding: 7px 10px; border: 1px solid var(--border); border-radius: 9px; background: var(--panel-2); }
+.path-movement strong, .path-movement i { display: inline; }
+.path-movement i { padding: 0 7px; color: var(--accent); font-style: normal; }
+.path-movement small { display: block; margin-top: 2px; color: var(--muted); }
+.path-hop.replica_removed .path-order { color: #ffc9c9; background: #713541; }
+.events-title { margin-top: 20px !important; }
 .trace-events { margin: 0; padding-left: 24px; }
 .trace-events li { padding: 5px 0 10px 5px; color: var(--muted); border-left: 1px solid var(--border); }
 .trace-events strong, .trace-events small { display: block; color: var(--text); }

@@ -17,6 +17,10 @@ class FileService {
     this.primaryWriteLock = Promise.resolve();
   }
 
+  initializeStorage() {
+    return this.repository.initialize();
+  }
+
   async put(fileName, content, { updateCatalog = true } = {}) {
     this.node.assertJoined();
     const name = validateFileName(fileName);
@@ -24,10 +28,17 @@ class FileService {
     const bytes = Buffer.isBuffer(content) ? content : Buffer.from(content);
     const hashId = hashKey(name);
     const uploadedAt = this.clock().toISOString();
+    let previousHistory = [];
+    try {
+      previousHistory = (await this.replicationService().locate(name)).events || [];
+    } catch {
+      // Arquivo novo ou referências temporariamente indisponíveis.
+    }
     const uploadEvent = {
       id: randomUUID(),
       type: 'upload',
       timestamp: uploadedAt,
+      sequence: nextSequence(previousHistory),
       node: this.node.reference
     };
 
@@ -39,7 +50,7 @@ class FileService {
       hashId,
       uploadedBy: this.node.reference,
       uploadedAt,
-      history: [uploadEvent]
+      history: [...previousHistory, uploadEvent]
     });
     const replicas = await this.replicationService().replicate(name, bytes, hashId);
 
@@ -205,6 +216,7 @@ class FileService {
         id: transferId || randomUUID(),
         type: 'primary_transferred',
         timestamp,
+        sequence: nextSequence(metadata.history),
         node: target,
         fromNode: fromNode || this.node.reference
       };
@@ -264,6 +276,11 @@ function notFound(name) {
   const error = new Error(`Arquivo "${name}" não encontrado na rede`);
   error.code = 'ENOENT';
   return error;
+}
+
+function nextSequence(history = []) {
+  return history.reduce((highest, event) =>
+    Math.max(highest, Number(event.sequence) || 0), 0) + 1;
 }
 
 module.exports = { FileService };

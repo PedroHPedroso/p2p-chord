@@ -1,5 +1,6 @@
 'use strict';
 
+const { randomUUID } = require('node:crypto');
 const { hashKey } = require('../ring');
 const { REPLICA_COUNT, MAX_HOPS } = require('../chord-config');
 const { validateFileName } = require('../validation');
@@ -10,6 +11,7 @@ class ReplicationService {
     this.rpcClient = rpcClient;
     this.repository = repository;
     this.logger = logger;
+    this.replicationLocks = new Map();
   }
 
   async getTargets() {
@@ -33,6 +35,17 @@ class ReplicationService {
   }
 
   async replicate(fileName, content, hashId) {
+    const previous = this.replicationLocks.get(fileName) || Promise.resolve();
+    const next = previous.then(() => this.performReplication(fileName, content, hashId));
+    this.replicationLocks.set(fileName, next);
+    return next.finally(() => {
+      if (this.replicationLocks.get(fileName) === next) {
+        this.replicationLocks.delete(fileName);
+      }
+    });
+  }
+
+  async performReplication(fileName, content, hashId) {
     const targets = await this.getTargets();
     const replicas = [];
     let metadata = null;
@@ -41,8 +54,28 @@ class ReplicationService {
     } catch {
       // Chamadas de compatibilidade podem não ter metadados adicionais.
     }
+    let currentHistory = metadata?.history || [];
+    let existingLocations = [];
+    try {
+      existingLocations = (await this.locate(fileName)).locations;
+    } catch {
+      // A gravação local recém-confirmada continua sendo a fonte da replicação.
+    }
+    const existingById = new Map(existingLocations.map((location) => [location.id, location]));
 
     for (const target of targets) {
+      const existing = existingById.get(target.id);
+      const createsReplica = !existing || existing.role !== 'replica'
+        || existing.primaryNodeId !== this.node.id;
+      const transferEvent = createsReplica ? {
+        id: randomUUID(),
+        type: 'replica_created',
+        timestamp: new Date().toISOString(),
+        sequence: nextSequence(currentHistory),
+        fromNode: this.node.reference,
+        node: target
+      } : null;
+      const history = mergeEvents([...currentHistory, transferEvent].filter(Boolean));
       try {
         const stored = await this.rpcClient.request(target, '/rpc/files', {
           method: 'PUT',
@@ -54,11 +87,17 @@ class ReplicationService {
             hashId,
             uploadedBy: metadata?.uploadedBy || this.node.reference,
             uploadedAt: metadata?.uploadedAt,
-            history: metadata?.history || [],
+            history,
             allowDemotion: true
           }
         });
-        if (stored.isReplica !== false) replicas.push(target);
+        if (stored.isReplica !== false) {
+          replicas.push(target);
+          if (transferEvent) {
+            metadata = await this.repository.appendHistory(fileName, transferEvent);
+            currentHistory = metadata.history || history;
+          }
+        }
         this.logger.log(`[replicação] "${fileName}" replicado com sucesso no nó ${target.id}.`);
       } catch (error) {
         this.logger.error(
@@ -84,6 +123,15 @@ class ReplicationService {
       try {
         await this.rpcClient.request(location,
           `/rpc/files?name=${encodeURIComponent(fileName)}&force=true`, { method: 'DELETE' });
+        const metadata = await this.repository.getMetadata(fileName);
+        await this.repository.appendHistory(fileName, {
+          id: randomUUID(),
+          type: 'replica_removed',
+          timestamp: new Date().toISOString(),
+          sequence: nextSequence(metadata.history),
+          fromNode: this.node.reference,
+          node: { id: location.id, host: location.host, port: location.port }
+        });
       } catch (error) {
         this.logger.error(
           `[replicação] Não foi possível remover a réplica excedente do nó ${location.id}: ${error.message}`);
@@ -178,8 +226,21 @@ function mergeEvents(events) {
     const id = event.id || `${event.type}-${event.timestamp}-${event.node?.id || ''}`;
     unique.set(id, { ...event, id });
   }
-  return [...unique.values()].sort((left, right) =>
-    String(left.timestamp || '').localeCompare(String(right.timestamp || '')));
+  return [...unique.values()].sort(compareEvents);
+}
+
+function compareEvents(left, right) {
+  const leftSequence = Number(left.sequence);
+  const rightSequence = Number(right.sequence);
+  if (leftSequence > 0 && rightSequence > 0 && leftSequence !== rightSequence) {
+    return leftSequence - rightSequence;
+  }
+  return String(left.timestamp || '').localeCompare(String(right.timestamp || ''));
+}
+
+function nextSequence(history = []) {
+  return history.reduce((highest, event) =>
+    Math.max(highest, Number(event.sequence) || 0), 0) + 1;
 }
 
 module.exports = { ReplicationService };

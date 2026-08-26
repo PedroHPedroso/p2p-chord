@@ -73,6 +73,11 @@ envie `DELETE` para a porta do nó no controlador:
 curl -X DELETE http://127.0.0.1:5000/api/nodes/5002
 ```
 
+Em caso de sucesso, a resposta contém `{"ok":true,"node":{...}}`. O
+controlador responde com `404` quando a porta não pertence a um nó local, `409`
+quando a topologia mudou ou já existe uma saída em andamento, `504` quando um
+vizinho excede o tempo limite e `400` para erros de validação.
+
 Antes de fechar o servidor, o nó:
 
 1. promove o predecessor como primário de seus arquivos;
@@ -118,7 +123,9 @@ rede. Isso evita que apenas o criador do anel enxergue os arquivos.
 O retorno do upload informa `primary`, `replicas` e `locations`. A gravação é
 confirmada somente depois da tentativa de criar até duas réplicas nos sucessores
 imediatos. A interface possui a ação **Rastrear**, que mostra quem inseriu o
-arquivo, o primário atual, as duas réplicas e o histórico de promoções. Para
+arquivo, o primário atual, as duas réplicas e o caminho cronológico completo:
+upload, origem e destino de cada réplica, remoções de cópias e transferências do
+primário. Verificações que não mudam a distribuição não duplicam eventos. Para
 consultar as mesmas informações em JSON:
 
 ```bash

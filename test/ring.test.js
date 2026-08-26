@@ -29,6 +29,8 @@ test('primeiro nó cria anel e preenche cinco fingers', async () => {
   assert.equal(node.predecessor.id, 8);
   assert.ok(node.fingers.every((finger) => finger.node.id === 8));
   assert.deepEqual(node.fingers.map((finger) => finger.start), [9, 10, 12, 16, 24]);
+  assert.equal(node.state().leavePhase, 'active');
+  assert.equal(node.state().leaving, false);
 });
 
 test('cada nó aceita uma porta própria e rejeita portas inválidas', () => {
@@ -127,7 +129,10 @@ test('upload confirma o nó primário e as réplicas nos sucessores imediatos', 
   assert.equal(catalogResponse.status, 200);
   assert.ok((await catalogResponse.json()).names.includes(name));
   const panelResponse = await fetch(`http://127.0.0.1:${running[1].node.port}/`);
-  assert.match(await panelResponse.text(), /id="file-trace"/);
+  const panel = await panelResponse.text();
+  assert.match(panel, /id="file-trace"/);
+  assert.match(panel, /id="trace-path"/);
+  assert.match(panel, /Caminho completo do arquivo/);
 
   const locationsResponse = await fetch(
     `http://127.0.0.1:${running[0].node.port}/api/files/locations?name=${encodeURIComponent(name)}`);
@@ -139,7 +144,15 @@ test('upload confirma o nó primário e as réplicas nos sucessores imediatos', 
     { id: 28, role: 'replica' }
   ]);
   assert.equal(located.uploadedBy.id, 8);
-  assert.equal(located.events[0].type, 'upload');
+  assert.deepEqual(located.events.map((event) => event.type), [
+    'upload',
+    'replica_created',
+    'replica_created'
+  ]);
+  assert.deepEqual(located.events.slice(1).map((event) => [
+    event.fromNode.id,
+    event.node.id
+  ]), [[8, 20], [8, 28]]);
 });
 
 test('download usa uma réplica quando o nó primário fica offline abruptamente', async (t) => {
@@ -257,9 +270,43 @@ test('saída com quatro nós mantém o predecessor como primário e só dois suc
   assert.equal(located.primary.id, 12);
   assert.deepEqual(located.replicas.map((node) => node.id), [4, 28]);
   assert.equal(located.locations.length, 3);
-  assert.equal(located.events.at(-1).type, 'primary_transferred');
-  assert.equal(located.events.at(-1).fromNode.id, 20);
-  assert.equal(located.events.at(-1).node.id, 12);
+  const transfer = located.events.find((event) => event.type === 'primary_transferred');
+  assert.equal(transfer.fromNode.id, 20);
+  assert.equal(transfer.node.id, 12);
+  const sequences = located.events.map((event) => event.sequence);
+  assert.deepEqual(sequences, [...sequences].sort((left, right) => left - right));
+});
+
+test('histórico registra criação e remoção ao mudar o caminho das réplicas', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'chord-file-path-'));
+  const running = await startRing([8, 20, 28], directory);
+  t.after(async () => {
+    await Promise.allSettled(running.map((entry) => entry.close()));
+    await fs.rm(directory, { recursive: true, force: true });
+  });
+
+  const name = 'caminho-completo.txt';
+  await running[0].node.put(name, Buffer.from('trilha persistida'));
+  const inserted = await startNodeServer({
+    id: 12,
+    port: await freePort(),
+    storageDirectory: path.join(directory, '12')
+  });
+  await inserted.node.join(running[0].node.reference);
+  running.push(inserted);
+  await running[0].node.refreshFingerTable();
+  await running[0].node.verifyReplicas();
+
+  const firstTrace = await running[0].node.locateFile(name);
+  assert.deepEqual(firstTrace.replicas.map((node) => node.id), [12, 20]);
+  assert.ok(firstTrace.events.some((event) =>
+    event.type === 'replica_created' && event.node.id === 12));
+  assert.ok(firstTrace.events.some((event) =>
+    event.type === 'replica_removed' && event.node.id === 28));
+
+  const eventCount = firstTrace.events.length;
+  await running[0].node.verifyReplicas();
+  assert.equal((await running[0].node.locateFile(name)).events.length, eventCount);
 });
 
 test('saída de um nó réplica recompõe as duas cópias antes de encerrar', async (t) => {
@@ -358,6 +405,8 @@ test('único nó pode sair sem consultar a rede', async () => {
   await node.join(null);
   const state = await node.leave();
   assert.equal(state.joined, false);
+  assert.equal(state.leavePhase, 'left');
+  assert.equal(state.leaving, false);
   assert.equal(state.predecessor, null);
   assert.equal(state.successor, null);
   assert.ok(state.fingerTable.every((finger) => finger.node === null));

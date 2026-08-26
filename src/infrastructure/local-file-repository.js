@@ -84,6 +84,22 @@ class LocalFileRepository {
     return metadata[name];
   }
 
+  async appendHistory(fileName, event) {
+    const name = validateFileName(fileName);
+    await this.initialize();
+    return this.withMetadataLock(async () => {
+      const metadata = await this.readMetadataFile();
+      if (!metadata[name]) throw notFound(name);
+      const currentHistory = metadata[name].history || [];
+      const history = mergeHistory(currentHistory, event);
+      if (history.length !== currentHistory.length) {
+        metadata[name] = { ...metadata[name], history };
+        await this.writeMetadataFile(metadata);
+      }
+      return metadata[name];
+    });
+  }
+
   async listPrimaryFiles({ includeCatalog = false } = {}) {
     const metadata = await this.readMetadata();
     return Object.entries(metadata)

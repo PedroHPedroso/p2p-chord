@@ -39,6 +39,7 @@ const elements = {
   tracePrimaryAddress: document.querySelector('#trace-primary-address'),
   traceReplicaCount: document.querySelector('#trace-replica-count'),
   traceLocations: document.querySelector('#trace-locations'),
+  tracePath: document.querySelector('#trace-path'),
   traceEvents: document.querySelector('#trace-events')
 };
 
@@ -101,8 +102,10 @@ function render(state) {
   elements.nodeTitle.textContent = state.node.id;
   elements.currentId.textContent = state.node.id;
   elements.nodeAddress.textContent = `http://${address(state.node)}`;
-  elements.joinedLabel.textContent = state.joined ? 'No anel' : 'Fora do anel';
-  elements.joinedLabel.classList.toggle('active', state.joined);
+  elements.joinedLabel.textContent = state.leaving
+    ? `Saindo (${state.leavePhase})`
+    : state.joined ? 'No anel' : 'Fora do anel';
+  elements.joinedLabel.classList.toggle('active', state.joined && !state.leaving);
   elements.joinPanel.hidden = state.joined;
   elements.filesPanel.hidden = !state.joined;
   renderNode(elements.predecessorId, elements.predecessorAddress, state.predecessor);
@@ -156,6 +159,7 @@ async function showFileTrace(name) {
   elements.traceName.textContent = name;
   elements.traceHash.textContent = 'Consultando a rede…';
   elements.traceLocations.innerHTML = '<p class="muted">Localizando cópias…</p>';
+  elements.tracePath.replaceChildren();
   elements.traceEvents.replaceChildren();
   elements.fileTrace.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 
@@ -206,6 +210,7 @@ function renderFileTrace(result) {
   }
 
   const events = result.events || [];
+  renderTracePath(events);
   if (!events.length) {
     const item = document.createElement('li');
     item.textContent = 'Não há eventos registrados para este arquivo.';
@@ -217,6 +222,10 @@ function renderFileTrace(result) {
     const label = document.createElement('strong');
     if (event.type === 'upload') {
       label.textContent = `Nó ${event.node?.id ?? '?'} inseriu o arquivo`;
+    } else if (event.type === 'replica_created') {
+      label.textContent = `Réplica enviada do nó ${event.fromNode?.id ?? '?'} para o nó ${event.node?.id ?? '?'}`;
+    } else if (event.type === 'replica_removed') {
+      label.textContent = `Réplica removida do nó ${event.node?.id ?? '?'}`;
     } else if (event.type === 'primary_transferred') {
       label.textContent = `Primário transferido do nó ${event.fromNode?.id ?? '?'} para o nó ${event.node?.id ?? '?'}`;
     } else {
@@ -229,6 +238,61 @@ function renderFileTrace(result) {
     item.append(label, time);
     return item;
   }));
+}
+
+function renderTracePath(events) {
+  if (!events.length) {
+    elements.tracePath.innerHTML = '<p class="muted">O caminho anterior não foi registrado.</p>';
+    return;
+  }
+
+  elements.tracePath.replaceChildren(...events.map((event, index) => {
+    const hop = document.createElement('div');
+    hop.className = `path-hop ${event.type}`;
+    const order = document.createElement('span');
+    order.className = 'path-order';
+    order.textContent = event.sequence || index + 1;
+    const movement = document.createElement('span');
+    movement.className = 'path-movement';
+    const origin = document.createElement('strong');
+    const destination = document.createElement('strong');
+    const arrow = document.createElement('i');
+    arrow.textContent = '→';
+    const description = document.createElement('small');
+
+    if (event.type === 'upload') {
+      origin.textContent = 'Entrada';
+      destination.textContent = nodeLabel(event.node);
+      description.textContent = 'Upload recebido e primário criado';
+    } else if (event.type === 'replica_created') {
+      origin.textContent = nodeLabel(event.fromNode);
+      destination.textContent = nodeLabel(event.node);
+      description.textContent = 'Réplica criada no sucessor';
+    } else if (event.type === 'primary_transferred') {
+      origin.textContent = nodeLabel(event.fromNode);
+      destination.textContent = nodeLabel(event.node);
+      description.textContent = 'Primário transferido durante a saída do nó';
+    } else if (event.type === 'replica_removed') {
+      origin.textContent = nodeLabel(event.fromNode);
+      destination.textContent = nodeLabel(event.node);
+      description.textContent = 'Cópia removida da rota atual de réplicas';
+      arrow.textContent = '×';
+    } else {
+      origin.textContent = 'Armazenamento anterior';
+      destination.textContent = nodeLabel(event.node);
+      description.textContent = 'Registro importado sem origem conhecida';
+    }
+    movement.append(origin, arrow, destination, description);
+    hop.append(order, movement);
+    return hop;
+  }));
+}
+
+function nodeLabel(node) {
+  if (!node?.id) return 'Nó desconhecido';
+  return node.host && node.port
+    ? `Nó ${node.id} (${address(node)})`
+    : `Nó ${node.id}`;
 }
 
 function formatDate(value) {

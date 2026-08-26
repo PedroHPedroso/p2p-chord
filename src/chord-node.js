@@ -225,6 +225,8 @@ class ChordNode {
     return {
       node: this.reference,
       joined: this.joined,
+      leaving: this.leaving,
+      leavePhase: this._leavePhase,
       predecessor: this.predecessor,
       successor: this.successor,
       fingerTable: this.fingers

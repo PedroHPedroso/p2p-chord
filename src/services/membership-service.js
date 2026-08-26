@@ -12,10 +12,10 @@ class MembershipService {
   }
 
   async createRing() {
+    await this.fileService.initializeStorage();
     this.node.predecessor = this.node.reference;
     for (const finger of this.node.fingers) finger.node = this.node.reference;
     this.node.joined = true;
-    await this.node.fileRepository.initialize();
     return this.node.state();
   }
 

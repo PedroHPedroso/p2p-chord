@@ -6,7 +6,45 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const { LocalFileRepository } = require('../src/infrastructure/local-file-repository');
+const { HttpRpcClient, httpStatusForError } = require('../src/infrastructure/http-rpc-client');
 const { RoutingService } = require('../src/services/routing-service');
+
+test('erros HTTP seguem os códigos públicos definidos na especificação', () => {
+  assert.equal(httpStatusForError({ code: 'ETIMEDOUT' }), 504);
+  assert.equal(httpStatusForError({ name: 'AbortError' }), 504);
+  assert.equal(httpStatusForError({ code: 'ESTALE_TOPOLOGY' }), 409);
+  assert.equal(httpStatusForError({ code: 'ELEAVEINPROGRESS' }), 409);
+  assert.equal(httpStatusForError({ code: 'ENODENOTFOUND' }, {
+    notFoundCodes: ['ENODENOTFOUND']
+  }), 404);
+  assert.equal(httpStatusForError({ status: 422 }), 422);
+});
+
+test('cliente RPC preserva conflito HTTP e converte aborto em timeout', async () => {
+  const target = { id: 8, host: '127.0.0.1', port: 5008 };
+  const conflictClient = new HttpRpcClient({
+    fetchImplementation: async () => ({
+      ok: false,
+      status: 409,
+      json: async () => ({ error: 'topologia alterada' })
+    })
+  });
+  await assert.rejects(conflictClient.request(target, '/rpc/test'), (error) =>
+    error.status === 409 && error.message === 'topologia alterada');
+
+  const timeoutClient = new HttpRpcClient({
+    timeout: 5,
+    fetchImplementation: async (_url, { signal }) => new Promise((_resolve, reject) => {
+      signal.addEventListener('abort', () => {
+        const error = new Error('aborted');
+        error.name = 'AbortError';
+        reject(error);
+      });
+    })
+  });
+  await assert.rejects(timeoutClient.request(target, '/rpc/test'), (error) =>
+    error.code === 'ETIMEDOUT');
+});
 
 test('repositório local impede que réplica atrasada sobrescreva o primário', async (t) => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'chord-repository-test-'));

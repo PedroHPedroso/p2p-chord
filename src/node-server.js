@@ -5,6 +5,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const { URL } = require('node:url');
 const { ChordNode, normalizeReference, CATALOG_NAME, REPLICA_META_NAME } = require('./chord-node');
+const { httpStatusForError } = require('./infrastructure/http-rpc-client');
 
 const PUBLIC_DIRECTORY = path.join(__dirname, '..', 'public');
 const STATIC_FILES = {
@@ -183,9 +184,7 @@ async function handleNodeRequest(node, request, response) {
     }
     return json(response, 404, { error: 'Rota não encontrada' });
   } catch (error) {
-    const status = error.status || (error.name === 'AbortError' || error.code === 'ETIMEDOUT'
-      ? 504 : error.code === 'ENOENT' ? 404
-        : error.code === 'ESTALE_TOPOLOGY' || error.code === 'ELEAVEINPROGRESS' ? 409 : 400);
+    const status = httpStatusForError(error, { notFoundCodes: ['ENOENT'] });
     return json(response, status, { error: error.message });
   }
 }

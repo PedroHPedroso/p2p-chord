@@ -6,6 +6,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const { URL } = require('node:url');
 const { startNodeServer } = require('./node-server');
+const { httpStatusForError } = require('./infrastructure/http-rpc-client');
 
 const CONTROL_PORT = Number(process.env.PORT || 5000);
 const PUBLIC_DIRECTORY = path.join(__dirname, '..', 'public');
@@ -80,9 +81,7 @@ const server = http.createServer(async (request, response) => {
     }
     return json(response, 404, { error: 'Rota não encontrada' });
   } catch (error) {
-    const status = error.code === 'ENODENOTFOUND' ? 404
-      : error.code === 'ELEAVEINPROGRESS' || error.status === 409 ? 409
-        : error.status || 400;
+    const status = httpStatusForError(error, { notFoundCodes: ['ENODENOTFOUND'] });
     return json(response, status, { error: error.message });
   }
 });

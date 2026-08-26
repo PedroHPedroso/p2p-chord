@@ -43,4 +43,15 @@ class HttpRpcClient {
   }
 }
 
-module.exports = { HttpRpcClient };
+const TIMEOUT_CODES = new Set(['ETIMEDOUT']);
+const CONFLICT_CODES = new Set(['ESTALE_TOPOLOGY', 'ELEAVEINPROGRESS']);
+
+function httpStatusForError(error, { notFoundCodes = [] } = {}) {
+  if (Number.isInteger(error?.status)) return error.status;
+  if (error?.name === 'AbortError' || TIMEOUT_CODES.has(error?.code)) return 504;
+  if (CONFLICT_CODES.has(error?.code)) return 409;
+  if (notFoundCodes.includes(error?.code)) return 404;
+  return 400;
+}
+
+module.exports = { HttpRpcClient, httpStatusForError };
