@@ -310,7 +310,7 @@ async function fillFileLocations(name, target) {
     const replicas = result.locations.filter((location) => location.role === 'replica');
     const parts = [];
     if (primary) parts.push(`Primário: nó ${primary.id}`);
-    if (replicas.length) parts.push(`Réplicas: ${replicas.map((node) => `nó ${node.id}`).join(', ')}`);
+    if (replicas.length) parts.push(`Réplica: nó ${replicas[0].id}`);
     target.textContent = parts.join(' · ') || 'Nenhuma cópia online encontrada';
   } catch {
     target.textContent = 'Localizações indisponíveis';
@@ -437,10 +437,10 @@ elements.uploadForm.addEventListener('submit', async (event) => {
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || 'Não foi possível enviar o arquivo');
     const primary = `nó ${result.primary.id} (${address(result.primary)})`;
-    const replicas = result.replicas.length
-      ? result.replicas.map((node) => `nó ${node.id} (${address(node)})`).join(', ')
+    const replica = result.replicas.length
+      ? `nó ${result.replicas[0].id} (${address(result.replicas[0])})`
       : 'nenhuma cópia confirmada';
-    elements.uploadMessage.textContent = `Hash ${result.hashId}. Primário: ${primary}. Réplicas: ${replicas}.`;
+    elements.uploadMessage.textContent = `Hash ${result.hashId}. Primário: ${primary}. Réplica: ${replica}.`;
     elements.uploadForm.reset();
     elements.selectedFile.textContent = 'Nenhum arquivo selecionado';
     await refreshCatalog();

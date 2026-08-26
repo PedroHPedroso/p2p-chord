@@ -100,7 +100,7 @@ test('upload permanece primário no nó de origem e pode ser lido por outro nó'
   assert.match((await first.node.get('catalogo.txt')).content.toString(), new RegExp(name));
 });
 
-test('upload confirma o nó primário e as réplicas nos sucessores imediatos', async (t) => {
+test('upload confirma o nó primário e uma réplica somente no sucessor imediato', async (t) => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'chord-replica-locations-'));
   const running = await startRing([8, 20, 28], directory);
   t.after(async () => {
@@ -109,17 +109,18 @@ test('upload confirma o nó primário e as réplicas nos sucessores imediatos', 
   });
 
   const name = findNameInInterval('replicas', 8, 20);
-  const bytes = Buffer.from('três cópias confirmadas');
+  const bytes = Buffer.from('primário e uma réplica confirmados');
   const stored = await running[0].node.put(name, bytes);
 
   assert.equal(stored.primary.id, 8);
-  assert.deepEqual(stored.replicas.map((node) => node.id), [20, 28]);
+  assert.deepEqual(stored.replicas.map((node) => node.id), [20]);
   assert.deepEqual(stored.locations.map(({ id, role }) => ({ id, role })), [
     { id: 8, role: 'primary' },
-    { id: 20, role: 'replica' },
-    { id: 28, role: 'replica' }
+    { id: 20, role: 'replica' }
   ]);
-  for (const entry of running) assert.deepEqual(await entry.node.readLocal(name), bytes);
+  assert.deepEqual(await running[0].node.readLocal(name), bytes);
+  assert.deepEqual(await running[1].node.readLocal(name), bytes);
+  await assert.rejects(running[2].node.readLocal(name), /não encontrado/);
   for (const entry of running) {
     assert.match((await entry.node.get('catalogo.txt')).content.toString(), new RegExp(name));
     assert.ok((await entry.node.fileRepository.readCatalogNames()).includes(name));
@@ -140,19 +141,18 @@ test('upload confirma o nó primário e as réplicas nos sucessores imediatos', 
   const located = await locationsResponse.json();
   assert.deepEqual(located.locations.map(({ id, role }) => ({ id, role })), [
     { id: 8, role: 'primary' },
-    { id: 20, role: 'replica' },
-    { id: 28, role: 'replica' }
+    { id: 20, role: 'replica' }
   ]);
+  assert.equal(located.replicaLimit, 1);
   assert.equal(located.uploadedBy.id, 8);
   assert.deepEqual(located.events.map((event) => event.type), [
     'upload',
-    'replica_created',
     'replica_created'
   ]);
   assert.deepEqual(located.events.slice(1).map((event) => [
     event.fromNode.id,
     event.node.id
-  ]), [[8, 20], [8, 28]]);
+  ]), [[8, 20]]);
 });
 
 test('download usa uma réplica quando o nó primário fica offline abruptamente', async (t) => {
@@ -172,7 +172,7 @@ test('download usa uma réplica quando o nó primário fica offline abruptamente
   const response = await fetch(
     `http://127.0.0.1:${running[0].node.port}/api/files?name=${encodeURIComponent(name)}`);
   assert.equal(response.status, 200);
-  assert.equal(response.headers.get('x-chord-node-id'), '8');
+  assert.equal(response.headers.get('x-chord-node-id'), '28');
   assert.equal(response.headers.get('x-chord-copy-role'), 'replica');
   assert.deepEqual(Buffer.from(await response.arrayBuffer()), bytes);
 });
@@ -190,7 +190,7 @@ test('novo upload do mesmo nome transfere a primazia para o nó que enviou', asy
 
   const located = await running[1].node.locateFile('mesmo-nome.txt');
   assert.equal(located.primary.id, 28);
-  assert.deepEqual(located.replicas.map((node) => node.id), [8, 20]);
+  assert.deepEqual(located.replicas.map((node) => node.id), [8]);
   assert.equal(located.locations.filter((node) => node.role === 'primary').length, 1);
   assert.equal(located.uploadedBy.id, 28);
   assert.equal((await running[0].node.get('mesmo-nome.txt')).content.toString(), 'segunda versão');
@@ -217,7 +217,7 @@ test('saída controlada religa os vizinhos e remove o nó das finger tables', as
   assert.ok(running[2].node.fingers.every((finger) => finger.node.id !== 20));
 });
 
-test('saída promove o predecessor e replica nos sucessores dele', async (t) => {
+test('saída promove o predecessor e replica somente no sucessor dele', async (t) => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'chord-leave-files-'));
   const running = await startRing([8, 20, 28], directory);
   t.after(async () => {
@@ -253,7 +253,7 @@ test('saída promove o predecessor e replica nos sucessores dele', async (t) => 
   assert.deepEqual(await running[0].node.readLocal(name), bytes);
 });
 
-test('saída com quatro nós mantém o predecessor como primário e só dois sucessores', async (t) => {
+test('saída com quatro nós mantém o predecessor como primário e apenas seu sucessor', async (t) => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'chord-leave-three-copies-'));
   const running = await startRing([4, 12, 20, 28], directory);
   t.after(async () => {
@@ -262,14 +262,14 @@ test('saída com quatro nós mantém o predecessor como primário e só dois suc
   });
 
   const name = 'promocao-controlada.bin';
-  await running[2].node.put(name, Buffer.from('primário e duas réplicas'));
+  await running[2].node.put(name, Buffer.from('primário e uma réplica'));
   await running[2].node.leave();
   await running[2].close();
 
   const located = await running[1].node.locateFile(name);
   assert.equal(located.primary.id, 12);
-  assert.deepEqual(located.replicas.map((node) => node.id), [4, 28]);
-  assert.equal(located.locations.length, 3);
+  assert.deepEqual(located.replicas.map((node) => node.id), [28]);
+  assert.equal(located.locations.length, 2);
   const transfer = located.events.find((event) => event.type === 'primary_transferred');
   assert.equal(transfer.fromNode.id, 20);
   assert.equal(transfer.node.id, 12);
@@ -298,18 +298,18 @@ test('histórico registra criação e remoção ao mudar o caminho das réplicas
   await running[0].node.verifyReplicas();
 
   const firstTrace = await running[0].node.locateFile(name);
-  assert.deepEqual(firstTrace.replicas.map((node) => node.id), [12, 20]);
+  assert.deepEqual(firstTrace.replicas.map((node) => node.id), [12]);
   assert.ok(firstTrace.events.some((event) =>
     event.type === 'replica_created' && event.node.id === 12));
   assert.ok(firstTrace.events.some((event) =>
-    event.type === 'replica_removed' && event.node.id === 28));
+    event.type === 'replica_removed' && event.node.id === 20));
 
   const eventCount = firstTrace.events.length;
   await running[0].node.verifyReplicas();
   assert.equal((await running[0].node.locateFile(name)).events.length, eventCount);
 });
 
-test('saída de um nó réplica recompõe as duas cópias antes de encerrar', async (t) => {
+test('saída do nó réplica recompõe uma cópia no novo sucessor antes de encerrar', async (t) => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'chord-leave-replica-'));
   const running = await startRing([4, 12, 20, 28], directory);
   t.after(async () => {
@@ -324,8 +324,8 @@ test('saída de um nó réplica recompõe as duas cópias antes de encerrar', as
 
   const located = await running[0].node.locateFile(name);
   assert.equal(located.primary.id, 4);
-  assert.deepEqual(located.replicas.map((node) => node.id), [20, 28]);
-  assert.equal(located.locations.length, 3);
+  assert.deepEqual(located.replicas.map((node) => node.id), [20]);
+  assert.equal(located.locations.length, 2);
 });
 
 test('saída de dois nós para um faz o sobrevivente apontar para si mesmo', async (t) => {

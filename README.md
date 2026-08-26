@@ -83,7 +83,7 @@ Antes de fechar o servidor, o nó:
 1. promove o predecessor como primário de seus arquivos;
 2. faz o predecessor apontar para o sucessor e vice-versa;
 3. percorre o anel e aguarda a atualização das finger tables;
-4. sincroniza novamente os arquivos e cria réplicas nos dois sucessores do novo primário;
+4. sincroniza novamente os arquivos e cria uma réplica no sucessor imediato do novo primário;
 5. fecha o servidor somente depois da conclusão dessas etapas.
 
 Se a transferência ou a religação falhar, o nó permanece aberto e registrado
@@ -105,8 +105,8 @@ npm test
 ## Arquivos: `put` e `get`
 
 Cada `ChordNode` oferece `put(nome, conteúdo)` e `get(nome)`. O nó que recebe o
-upload mantém a cópia primária; seus dois sucessores imediatos recebem as
-réplicas. O SHA-256 do nome continua sendo convertido para uma posição entre 1
+upload mantém a cópia primária; somente seu sucessor imediato recebe uma
+réplica. O SHA-256 do nome continua sendo convertido para uma posição entre 1
 e 32 para identificar o arquivo no Chord, enquanto a localização atual é
 resolvida pelo índice distribuído.
 
@@ -121,9 +121,9 @@ o catálogo ao entrar e `GET /api/catalog` reúne e repara os nomes encontrados 
 rede. Isso evita que apenas o criador do anel enxergue os arquivos.
 
 O retorno do upload informa `primary`, `replicas` e `locations`. A gravação é
-confirmada somente depois da tentativa de criar até duas réplicas nos sucessores
-imediatos. A interface possui a ação **Rastrear**, que mostra quem inseriu o
-arquivo, o primário atual, as duas réplicas e o caminho cronológico completo:
+confirmada somente depois da tentativa de criar uma réplica no sucessor
+imediato. A interface possui a ação **Rastrear**, que mostra quem inseriu o
+arquivo, o primário atual, a réplica e o caminho cronológico completo:
 upload, origem e destino de cada réplica, remoções de cópias e transferências do
 primário. Verificações que não mudam a distribuição não duplicam eventos. Para
 consultar as mesmas informações em JSON:
@@ -134,8 +134,8 @@ curl 'http://127.0.0.1:5001/api/files/locations?name=trabalho.txt'
 
 Durante o download, se o nó primário não entregar o arquivo, o nó consultado
 percorre as referências conhecidas e usa uma réplica disponível. Na saída
-controlada, o predecessor é promovido e passa a replicar para seus dois
-sucessores antes de o servidor fechar.
+controlada, o predecessor é promovido e passa a replicar para seu sucessor
+imediato antes de o servidor fechar.
 
 ```bash
 curl -X POST http://127.0.0.1:5001/api/files \

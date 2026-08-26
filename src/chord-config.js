@@ -2,7 +2,7 @@
 
 const CATALOG_NAME = 'catalogo.txt';
 const REPLICA_META_NAME = 'replicas.json';
-const REPLICA_COUNT = 2;
+const REPLICA_COUNT = 1;
 const MAX_HOPS = 32;
 
 module.exports = {
