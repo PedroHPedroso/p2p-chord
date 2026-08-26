@@ -54,6 +54,9 @@ async function handleNodeRequest(node, request, response) {
       const content = Buffer.from(body.content || '', body.encoding === 'base64' ? 'base64' : 'utf8');
       return json(response, 201, await node.put(body.name, content));
     }
+    if (request.method === 'GET' && url.pathname === '/api/catalog') {
+      return json(response, 200, { names: await node.getCatalog() });
+    }
     if (request.method === 'GET' && url.pathname === '/api/files/locations') {
       return json(response, 200, await node.locateFile(url.searchParams.get('name')));
     }
@@ -104,6 +107,10 @@ async function handleNodeRequest(node, request, response) {
       return json(response, 200,
         await node.repairRingFingerTables(body.originId, body.hops || 0));
     }
+    if (request.method === 'POST' && url.pathname === '/rpc/verify-replicas') {
+      await node.verifyReplicas();
+      return json(response, 200, { ok: true });
+    }
     if (request.method === 'PUT' && url.pathname === '/rpc/files') {
       const body = await readJson(request);
       const content = Buffer.from(body.content || '', 'base64');
@@ -111,7 +118,11 @@ async function handleNodeRequest(node, request, response) {
       await node.storeLocal(body.name, content, {
         isReplica,
         primaryNodeId: body.primaryNodeId ?? null,
-        hashId: body.hashId ?? null
+        hashId: body.hashId ?? null,
+        uploadedBy: body.uploadedBy || null,
+        uploadedAt: body.uploadedAt || null,
+        history: body.history || [],
+        allowDemotion: Boolean(body.allowDemotion)
       });
       const replicas = !isReplica && body.replicate !== false
         ? await node.replicateFile(body.name, content, body.hashId ?? null)
@@ -135,12 +146,34 @@ async function handleNodeRequest(node, request, response) {
         primaryNodeId: meta.primaryNodeId
       });
     }
+    if (request.method === 'DELETE' && url.pathname === '/rpc/files') {
+      return json(response, 200, {
+        ok: true,
+        removed: url.searchParams.get('force') === 'true'
+          ? await node.fileRepository.removeFile(url.searchParams.get('name'))
+          : await node.fileRepository.removeReplica(url.searchParams.get('name'))
+      });
+    }
+    if (request.method === 'GET' && url.pathname === '/rpc/catalog') {
+      const names = new Set([
+        ...await node.fileRepository.readCatalogNames(),
+        ...await node.fileRepository.listFileNames()
+      ]);
+      return json(response, 200, { names: [...names] });
+    }
+    if (request.method === 'PUT' && url.pathname === '/rpc/catalog') {
+      const body = await readJson(request);
+      return json(response, 200, {
+        ok: true,
+        names: await node.fileRepository.mergeCatalogEntries(body.names || [])
+      });
+    }
     // Verifica se uma réplica existe antes de transferi-la, evitando envios desnecessários.
     if (request.method === 'GET' && url.pathname === '/rpc/replica-check') {
       const name = url.searchParams.get('name');
       try {
         const meta = await node.getReplicaMeta(name);
-        return json(response, 200, { exists: true, isReplica: meta.isReplica });
+        return json(response, 200, { exists: true, ...meta });
       } catch (error) {
         if (error.code === 'ENOENT') {
           return json(response, 200, { exists: false, isReplica: false });

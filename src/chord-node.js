@@ -38,14 +38,16 @@ class ChordNode {
     this.joined = false;
     this.leaving = false;
     this._leavePhase = 'active';
-    this._leaveSuccessor = null;
+    this._leaveTarget = null;
+    this._leaveTransferId = null;
     this._leaveDetached = false;
     this._leaveSuccessorRewired = false;
 
     this.rpcClient = dependencies.rpcClient || new HttpRpcClient({ timeout: requestTimeout });
     this.fileRepository = dependencies.fileRepository || new LocalFileRepository({
       directory: this.storageDirectory,
-      nodeId: this.id
+      nodeId: this.id,
+      nodeReference: this.reference
     });
     this.routingService = dependencies.routingService || new RoutingService({
       node: this,
@@ -147,6 +149,14 @@ class ChordNode {
     return this.fileService.addToCatalog(fileName);
   }
 
+  getCatalog() {
+    return this.fileService.getNetworkCatalog();
+  }
+
+  syncCatalog(node) {
+    return this.fileService.syncCatalog(node);
+  }
+
   storeLocal(fileName, content, options) {
     return this.fileService.storeLocal(fileName, content, options);
   }
@@ -163,8 +173,8 @@ class ChordNode {
     return this.fileRepository.listPrimaryFiles(options);
   }
 
-  _transferPrimaryFiles(successor, options) {
-    return this.fileService.transferPrimaryFiles(successor, options);
+  _transferPrimaryFiles(target, options) {
+    return this.fileService.transferPrimaryFiles(target, options);
   }
 
   _forwardPrimaryFile(name, content, hashId) {

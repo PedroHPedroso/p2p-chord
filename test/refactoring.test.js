@@ -22,11 +22,31 @@ test('repositório local impede que réplica atrasada sobrescreva o primário', 
 
   assert.equal(stored, false);
   assert.equal((await repository.read('documento.txt')).toString(), 'primário');
-  assert.deepEqual(await repository.getMetadata('documento.txt'), {
-    hashId: 14,
-    primaryNodeId: 20,
-    isReplica: false
-  });
+  assert.deepEqual(await repository.getMetadata('documento.txt').then(({ hashId,
+    primaryNodeId, isReplica }) => ({ hashId, primaryNodeId, isReplica })), {
+      hashId: 14,
+      primaryNodeId: 20,
+      isReplica: false
+    });
+});
+
+test('repositório migra primary/replica e index.json sem apagar dados antigos', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'chord-legacy-test-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  await fs.mkdir(path.join(directory, 'replica'));
+  await fs.writeFile(path.join(directory, 'replica', 'legado.txt'), 'preservado');
+  await fs.writeFile(path.join(directory, 'replica', 'catalogo.txt'), 'legado.txt\n');
+  await fs.writeFile(path.join(directory, 'index.json'), JSON.stringify({
+    primary: {},
+    replica: { 'legado.txt': { hashId: 7, primaryNodeId: 3 } }
+  }));
+
+  const repository = new LocalFileRepository({ directory, nodeId: 22 });
+  await repository.initialize();
+
+  assert.equal((await repository.read('legado.txt')).toString(), 'preservado');
+  assert.equal((await repository.getMetadata('legado.txt')).isReplica, true);
+  assert.deepEqual(await repository.readCatalogNames(), ['legado.txt']);
 });
 
 test('serviço de roteamento usa cliente RPC injetado sem depender de HTTP real', async () => {

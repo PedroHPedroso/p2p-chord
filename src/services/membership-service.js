@@ -11,17 +11,18 @@ class MembershipService {
     this.leavePromise = null;
   }
 
-  createRing() {
+  async createRing() {
     this.node.predecessor = this.node.reference;
     for (const finger of this.node.fingers) finger.node = this.node.reference;
     this.node.joined = true;
+    await this.node.fileRepository.initialize();
+    return this.node.state();
   }
 
   async join(bootstrap) {
     if (this.node.joined) throw new Error('Este nó já pertence a uma rede Chord');
     if (!bootstrap) {
-      this.createRing();
-      return this.node.state();
+      return this.createRing();
     }
 
     const contact = normalizeReference(bootstrap);
@@ -49,6 +50,7 @@ class MembershipService {
 
     this.node.joined = true;
     await this.routingService.refreshFingerTable();
+    await this.fileService.syncCatalog(this.node.successor);
     await this.rpcClient.request(this.node.successor, '/rpc/refresh-fingers', {
       method: 'POST',
       body: { originId: this.node.id, hops: 0 }
@@ -72,7 +74,7 @@ class MembershipService {
 
   async performLeave() {
     this.node.assertJoined();
-    const successor = this.node._leaveSuccessor || this.node.successor;
+    const successor = this.node.successor;
     const predecessor = this.node.predecessor;
     if (!successor || !predecessor) throw new Error('Topologia incompleta para sair da rede');
 
@@ -87,12 +89,17 @@ class MembershipService {
 
     this.node.leaving = true;
     this.node._leavePhase = 'draining';
-    this.node._leaveSuccessor = successor;
+    this.node._leaveTarget = predecessor;
+    this.node._leaveTransferId ||= `leave-${this.node.id}-${Date.now()}`;
 
     if (!this.node._leaveDetached) {
       try {
         await this.fileService.withPrimaryWriteLock(() =>
-          this.fileService.transferPrimaryFiles(successor, { replicate: false }));
+          this.fileService.transferPrimaryFiles(predecessor, {
+            replicate: false,
+            transferId: this.node._leaveTransferId,
+            fromNode: this.node.reference
+          }));
       } catch (error) {
         this.resetLeaveState();
         throw error;
@@ -105,11 +112,26 @@ class MembershipService {
       body: { originId: successor.id, hops: 0 }
     });
     await this.fileService.withPrimaryWriteLock(async () => {
-      await this.fileService.transferPrimaryFiles(successor);
+      await this.fileService.transferPrimaryFiles(predecessor, {
+        transferId: this.node._leaveTransferId,
+        fromNode: this.node.reference
+      });
       this.node._leavePhase = 'forwarding';
     });
+    await this.reconcileReplicas(successor);
     this.node.joined = false;
     return this.node.state();
+  }
+
+  async reconcileReplicas(start) {
+    const visited = new Set();
+    let current = start;
+    while (current && !visited.has(current.id) && visited.size < 32) {
+      visited.add(current.id);
+      await this.rpcClient.request(current, '/rpc/verify-replicas', { method: 'POST' });
+      const result = await this.rpcClient.request(current, '/rpc/successor');
+      current = result.node;
+    }
   }
 
   async detachNeighbors(successor, predecessor) {
@@ -150,7 +172,8 @@ class MembershipService {
   resetLeaveState() {
     this.node.leaving = false;
     this.node._leavePhase = 'active';
-    this.node._leaveSuccessor = null;
+    this.node._leaveTarget = null;
+    this.node._leaveTransferId = null;
     this.node._leaveDetached = false;
     this.node._leaveSuccessorRewired = false;
   }

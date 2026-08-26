@@ -75,10 +75,10 @@ curl -X DELETE http://127.0.0.1:5000/api/nodes/5002
 
 Antes de fechar o servidor, o nó:
 
-1. transfere seus arquivos primários, inclusive `catalogo.txt`, ao sucessor;
+1. promove o predecessor como primário de seus arquivos;
 2. faz o predecessor apontar para o sucessor e vice-versa;
 3. percorre o anel e aguarda a atualização das finger tables;
-4. sincroniza novamente os arquivos que possam ter mudado durante a saída;
+4. sincroniza novamente os arquivos e cria réplicas nos dois sucessores do novo primário;
 5. fecha o servidor somente depois da conclusão dessas etapas.
 
 Se a transferência ou a religação falhar, o nó permanece aberto e registrado
@@ -99,10 +99,11 @@ npm test
 
 ## Arquivos: `put` e `get`
 
-Cada `ChordNode` oferece `put(nome, conteúdo)` e `get(nome)`. O SHA-256 do nome
-é convertido para uma posição entre 1 e 32; `findSuccessor` escolhe o primeiro
-nó ativo nessa posição ou depois dela. Assim, posições sem nó são naturalmente
-armazenadas no próximo nó ativo do anel.
+Cada `ChordNode` oferece `put(nome, conteúdo)` e `get(nome)`. O nó que recebe o
+upload mantém a cópia primária; seus dois sucessores imediatos recebem as
+réplicas. O SHA-256 do nome continua sendo convertido para uma posição entre 1
+e 32 para identificar o arquivo no Chord, enquanto a localização atual é
+resolvida pelo índice distribuído.
 
 ```js
 await node.put('trabalho.txt', Buffer.from('conteúdo'));
@@ -110,13 +111,15 @@ const arquivo = await node.get('trabalho.txt');
 console.log(arquivo.content.toString());
 ```
 
-Todo `put` também atualiza `catalogo.txt` (um nome por linha). O catálogo usa o
-mesmo hash e é armazenado na própria rede. Pela API HTTP de qualquer nó:
+Todo `put` também atualiza `catalogo.txt` em cada nó ativo. Um nó novo sincroniza
+o catálogo ao entrar e `GET /api/catalog` reúne e repara os nomes encontrados na
+rede. Isso evita que apenas o criador do anel enxergue os arquivos.
 
 O retorno do upload informa `primary`, `replicas` e `locations`. A gravação é
 confirmada somente depois da tentativa de criar até duas réplicas nos sucessores
-imediatos. A interface mostra o ID e o endereço de cada nó que confirmou uma
-cópia. Para consultar novamente as localizações:
+imediatos. A interface possui a ação **Rastrear**, que mostra quem inseriu o
+arquivo, o primário atual, as duas réplicas e o histórico de promoções. Para
+consultar as mesmas informações em JSON:
 
 ```bash
 curl 'http://127.0.0.1:5001/api/files/locations?name=trabalho.txt'
@@ -124,7 +127,8 @@ curl 'http://127.0.0.1:5001/api/files/locations?name=trabalho.txt'
 
 Durante o download, se o nó primário não entregar o arquivo, o nó consultado
 percorre as referências conhecidas e usa uma réplica disponível. Na saída
-controlada, o primário também é promovido no sucessor antes de o servidor fechar.
+controlada, o predecessor é promovido e passa a replicar para seus dois
+sucessores antes de o servidor fechar.
 
 ```bash
 curl -X POST http://127.0.0.1:5001/api/files \
@@ -132,8 +136,12 @@ curl -X POST http://127.0.0.1:5001/api/files \
   -d '{"name":"trabalho.txt","content":"conteúdo"}'
 
 curl -OJ 'http://127.0.0.1:5001/api/files?name=trabalho.txt'
-curl 'http://127.0.0.1:5001/api/files?name=catalogo.txt'
+curl 'http://127.0.0.1:5001/api/catalog'
 ```
+
+Pastas criadas por versões anteriores (`primary/`, `replica/` e `index.json`)
+são migradas automaticamente na primeira inicialização. Os arquivos antigos são
+copiados para o formato atual e não precisam ser apagados manualmente.
 
 Para bytes arbitrários, envie `content` em Base64 e acrescente
 `"encoding":"base64"` ao JSON do `POST`.

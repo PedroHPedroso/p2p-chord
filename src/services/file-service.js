@@ -1,51 +1,59 @@
 'use strict';
 
+const { randomUUID } = require('node:crypto');
 const { hashKey } = require('../ring');
 const { CATALOG_NAME, MAX_HOPS } = require('../chord-config');
 const { validateFileName } = require('../validation');
 
 class FileService {
-  constructor({ node, rpcClient, repository, routingService, replicationService }) {
+  constructor({ node, rpcClient, repository, routingService, replicationService,
+    clock = () => new Date() }) {
     this.node = node;
     this.rpcClient = rpcClient;
     this.repository = repository;
     this.routingService = routingService;
     this.replicationService = replicationService;
+    this.clock = clock;
     this.primaryWriteLock = Promise.resolve();
   }
 
   async put(fileName, content, { updateCatalog = true } = {}) {
     this.node.assertJoined();
     const name = validateFileName(fileName);
+    if (name === CATALOG_NAME) throw new Error(`${CATALOG_NAME} é reservado para o controle da rede`);
     const bytes = Buffer.isBuffer(content) ? content : Buffer.from(content);
     const hashId = hashKey(name);
-    const owner = await this.routingService.findSuccessor(hashId);
+    const uploadedAt = this.clock().toISOString();
+    const uploadEvent = {
+      id: randomUUID(),
+      type: 'upload',
+      timestamp: uploadedAt,
+      node: this.node.reference
+    };
 
-    let replicas = [];
-    if (owner.id === this.node.id) {
-      await this.storeLocal(name, bytes, {
-        isReplica: false,
-        primaryNodeId: this.node.id,
-        hashId
-      });
-      replicas = await this.replicationService().replicate(name, bytes, hashId);
-    } else {
-      const stored = await this.rpcClient.request(owner, '/rpc/files', {
-        method: 'PUT',
-        body: { name, content: bytes.toString('base64'), hashId }
-      });
-      replicas = stored.replicas || [];
-    }
+    // O nó que recebeu o upload é o primário. O hash continua sendo exibido e
+    // usado pelo Chord, mas a localização é resolvida pelo índice distribuído.
+    await this.storeLocal(name, bytes, {
+      isReplica: false,
+      primaryNodeId: this.node.id,
+      hashId,
+      uploadedBy: this.node.reference,
+      uploadedAt,
+      history: [uploadEvent]
+    });
+    const replicas = await this.replicationService().replicate(name, bytes, hashId);
 
-    if (updateCatalog && name !== CATALOG_NAME) await this.addToCatalog(name);
+    if (updateCatalog) await this.addToCatalog(name);
     return {
       name,
       hashId,
-      node: owner,
-      primary: owner,
+      node: this.node.reference,
+      primary: this.node.reference,
       replicas,
+      uploadedBy: this.node.reference,
+      uploadedAt,
       locations: [
-        { ...owner, role: 'primary' },
+        { ...this.node.reference, role: 'primary' },
         ...replicas.map((replica) => ({ ...replica, role: 'replica' }))
       ],
       size: bytes.length
@@ -55,102 +63,117 @@ class FileService {
   async get(fileName) {
     this.node.assertJoined();
     const name = validateFileName(fileName);
-    const hashId = hashKey(name);
-    let owner = null;
-    try {
-      owner = await this.routingService.findSuccessor(hashId);
-      if (owner.id === this.node.id) {
-        const content = await this.repository.read(name);
-        const metadata = await this.repository.getMetadata(name);
-        return {
-          name,
-          hashId,
-          node: this.node.reference,
-          primary: owner,
-          isReplica: metadata.isReplica,
-          size: content.length,
-          content
-        };
-      }
-      const result = await this.rpcClient.request(
-        owner, `/rpc/files?name=${encodeURIComponent(name)}`);
-      const content = Buffer.from(result.content, 'base64');
+    if (name === CATALOG_NAME) {
+      const names = await this.getNetworkCatalog();
+      const content = Buffer.from(names.length ? `${names.join('\n')}\n` : '');
       return {
         name,
-        hashId,
-        node: owner,
-        primary: owner,
-        isReplica: Boolean(result.isReplica),
+        hashId: hashKey(name),
+        node: this.node.reference,
+        primary: null,
+        isReplica: false,
         size: content.length,
         content
       };
-    } catch (error) {
-      const recovered = await this.getFromKnownCopies(name);
-      if (recovered) {
-        return {
-          name,
-          hashId,
-          node: recovered.node,
-          primary: owner,
-          isReplica: recovered.isReplica,
-          size: recovered.content.length,
-          content: recovered.content
-        };
-      }
-      throw error;
     }
-  }
 
-  async getFromKnownCopies(name) {
-    const queue = [this.node.reference, this.node.predecessor, this.node.successor,
-      ...this.node.fingers.map((finger) => finger.node)].filter(Boolean);
-    const visited = new Set();
-
-    while (queue.length && visited.size < MAX_HOPS) {
-      const candidate = queue.shift();
-      if (!candidate || visited.has(candidate.id)) continue;
-      visited.add(candidate.id);
+    const located = await this.replicationService().locate(name);
+    const candidates = [located.primary, ...located.replicas].filter(Boolean);
+    let lastError = notFound(name);
+    for (const candidate of candidates) {
       try {
         if (candidate.id === this.node.id) {
           const content = await this.repository.read(name);
           const metadata = await this.repository.getMetadata(name);
-          return { node: this.node.reference, isReplica: metadata.isReplica, content };
+          return fileResult(name, content, this.node.reference, located.primary, metadata.isReplica);
         }
         const result = await this.rpcClient.request(
           candidate, `/rpc/files?name=${encodeURIComponent(name)}`);
-        return {
-          node: candidate,
-          isReplica: Boolean(result.isReplica),
-          content: Buffer.from(result.content, 'base64')
-        };
-      } catch {
-        if (candidate.id !== this.node.id) {
-          try {
-            const state = await this.rpcClient.request(candidate, '/api/state');
-            queue.push(state.predecessor, state.successor,
-              ...state.fingerTable.map((finger) => finger.node));
-          } catch {
-            // Indisponível; continua pelas referências restantes.
-          }
-        }
+        return fileResult(name, Buffer.from(result.content, 'base64'), candidate,
+          located.primary, Boolean(result.isReplica));
+      } catch (error) {
+        lastError = error;
       }
     }
-    return null;
+    throw lastError;
+  }
+
+  async getFromKnownCopies(name) {
+    const result = await this.get(name);
+    return { node: result.node, isReplica: result.isReplica, content: result.content };
   }
 
   async addToCatalog(fileName) {
-    let names = [];
-    try {
-      const catalog = await this.get(CATALOG_NAME);
-      names = catalog.content.toString('utf8').split(/\r?\n/).filter(Boolean);
-    } catch (error) {
-      if (error.code !== 'ENOENT' && !/não encontrado/i.test(error.message)) throw error;
+    const name = validateFileName(fileName);
+    await this.repository.addCatalogEntry(name);
+    const visited = new Set([this.node.id]);
+    const queue = [this.node.predecessor, this.node.successor,
+      ...this.node.fingers.map((finger) => finger.node)].filter(Boolean);
+
+    while (queue.length && visited.size < MAX_HOPS) {
+      const current = queue.shift();
+      if (!current || visited.has(current.id)) continue;
+      visited.add(current.id);
+      try {
+        await this.rpcClient.request(current, '/rpc/catalog', {
+          method: 'PUT',
+          body: { names: [name] }
+        });
+        const state = await this.rpcClient.request(current, '/api/state');
+        queue.push(state.predecessor, state.successor,
+          ...state.fingerTable.map((finger) => finger.node));
+      } catch {
+        // O arquivo já está confirmado; outros nós repararão o catálogo ao consultá-lo.
+      }
     }
-    if (!names.includes(fileName)) names.push(fileName);
-    names.sort((left, right) => left.localeCompare(right, 'pt-BR'));
-    await this.put(CATALOG_NAME, Buffer.from(`${names.join('\n')}\n`), {
-      updateCatalog: false
-    });
+  }
+
+  async getNetworkCatalog() {
+    this.node.assertJoined();
+    const names = new Set();
+    const visited = new Set();
+    const queue = [this.node.reference, this.node.predecessor, this.node.successor,
+      ...this.node.fingers.map((finger) => finger.node)].filter(Boolean);
+
+    while (queue.length && visited.size < MAX_HOPS) {
+      const current = queue.shift();
+      if (!current || visited.has(current.id)) continue;
+      visited.add(current.id);
+      if (current.id === this.node.id) {
+        const result = {
+          names: [...await this.repository.readCatalogNames(),
+            ...await this.repository.listFileNames()]
+        };
+        for (const name of result.names) names.add(name);
+      } else {
+        try {
+          const [result, state] = await Promise.all([
+            this.rpcClient.request(current, '/rpc/catalog'),
+            this.rpcClient.request(current, '/api/state')
+          ]);
+          for (const name of result.names || []) names.add(name);
+          queue.push(state.predecessor, state.successor,
+            ...state.fingerTable.map((finger) => finger.node));
+        } catch {
+          // Continua pelas referências restantes se este nó estiver offline.
+        }
+      }
+    }
+
+    const catalog = [...names].sort((left, right) => left.localeCompare(right, 'pt-BR'));
+    await this.repository.mergeCatalogEntries(catalog);
+    return catalog;
+  }
+
+  async syncCatalog(source) {
+    await this.repository.initialize();
+    if (!source || source.id === this.node.id) return this.repository.readCatalogNames();
+    try {
+      const result = await this.rpcClient.request(source, '/rpc/catalog');
+      return this.repository.mergeCatalogEntries(result.names || []);
+    } catch {
+      return this.repository.readCatalogNames();
+    }
   }
 
   async storeLocal(fileName, content, options = {}) {
@@ -159,43 +182,61 @@ class FileService {
     const { isReplica = false, hashId } = options;
     return this.withPrimaryWriteLock(async () => {
       if (!isReplica && this.node.leaving && this.node._leavePhase === 'forwarding') {
-        await this.forwardPrimaryFile(name, bytes, hashId);
-        return;
+        await this.forwardPrimaryFile(name, bytes, hashId, options);
+        return false;
       }
       const stored = await this.repository.store(name, bytes, options);
-      if (stored && !isReplica && this.node.leaving && this.node._leaveSuccessor) {
-        await this.forwardPrimaryFile(name, bytes, hashId);
+      if (stored && !isReplica && this.node.leaving && this.node._leaveTarget) {
+        await this.forwardPrimaryFile(name, bytes, hashId, options);
       }
+      return stored;
     });
   }
 
-  async transferPrimaryFiles(successor, { replicate = true } = {}) {
-    const files = await this.repository.listPrimaryFiles({ includeCatalog: true });
+  async transferPrimaryFiles(target, { replicate = true, transferId, fromNode } = {}) {
+    const files = await this.repository.listPrimaryFiles();
     for (const file of files) {
-      const content = await this.repository.read(file.name);
-      await this.rpcClient.request(successor, '/rpc/files', {
+      const [content, metadata] = await Promise.all([
+        this.repository.read(file.name),
+        this.repository.getMetadata(file.name)
+      ]);
+      const timestamp = this.clock().toISOString();
+      const event = {
+        id: transferId || randomUUID(),
+        type: 'primary_transferred',
+        timestamp,
+        node: target,
+        fromNode: fromNode || this.node.reference
+      };
+      await this.rpcClient.request(target, '/rpc/files', {
         method: 'PUT',
         body: {
           name: file.name,
           content: content.toString('base64'),
           isReplica: false,
           hashId: file.hashId,
-          replicate
+          replicate,
+          uploadedBy: metadata.uploadedBy,
+          uploadedAt: metadata.uploadedAt,
+          history: [...(metadata.history || []), event]
         }
       });
     }
   }
 
-  async forwardPrimaryFile(name, content, hashId) {
-    if (!this.node._leaveSuccessor) throw new Error('Sucessor de saída não definido');
-    await this.rpcClient.request(this.node._leaveSuccessor, '/rpc/files', {
+  async forwardPrimaryFile(name, content, hashId, metadata = {}) {
+    if (!this.node._leaveTarget) throw new Error('Destino da saída não definido');
+    await this.rpcClient.request(this.node._leaveTarget, '/rpc/files', {
       method: 'PUT',
       body: {
         name,
         content: content.toString('base64'),
         isReplica: false,
         hashId: hashId ?? null,
-        replicate: false
+        replicate: false,
+        uploadedBy: metadata.uploadedBy,
+        uploadedAt: metadata.uploadedAt,
+        history: metadata.history || []
       }
     });
   }
@@ -205,6 +246,24 @@ class FileService {
     this.primaryWriteLock = next.catch(() => {});
     return next;
   }
+}
+
+function fileResult(name, content, node, primary, isReplica) {
+  return {
+    name,
+    hashId: hashKey(name),
+    node,
+    primary,
+    isReplica,
+    size: content.length,
+    content
+  };
+}
+
+function notFound(name) {
+  const error = new Error(`Arquivo "${name}" não encontrado na rede`);
+  error.code = 'ENOENT';
+  return error;
 }
 
 module.exports = { FileService };

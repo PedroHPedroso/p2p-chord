@@ -35,6 +35,13 @@ class ReplicationService {
   async replicate(fileName, content, hashId) {
     const targets = await this.getTargets();
     const replicas = [];
+    let metadata = null;
+    try {
+      metadata = await this.repository.getMetadata(fileName);
+    } catch {
+      // Chamadas de compatibilidade podem não ter metadados adicionais.
+    }
+
     for (const target of targets) {
       try {
         const stored = await this.rpcClient.request(target, '/rpc/files', {
@@ -44,27 +51,56 @@ class ReplicationService {
             content: content.toString('base64'),
             isReplica: true,
             primaryNodeId: this.node.id,
-            hashId
+            hashId,
+            uploadedBy: metadata?.uploadedBy || this.node.reference,
+            uploadedAt: metadata?.uploadedAt,
+            history: metadata?.history || [],
+            allowDemotion: true
           }
         });
         if (stored.isReplica !== false) replicas.push(target);
-        this.logger.log(
-          `[replicação] "${fileName}" replicado com sucesso no nó ${target.id}.`);
+        this.logger.log(`[replicação] "${fileName}" replicado com sucesso no nó ${target.id}.`);
       } catch (error) {
         this.logger.error(
           `[replicação] Falha ao replicar "${fileName}" no nó ${target.id}: ${error.message}`);
       }
     }
+
+    await this.removeObsoleteReplicas(fileName, new Set(targets.map((target) => target.id)));
     return replicas;
+  }
+
+  async removeObsoleteReplicas(fileName, expectedIds) {
+    let locations;
+    try {
+      ({ locations } = await this.locate(fileName));
+    } catch (error) {
+      this.logger.error(`[replicação] Falha ao reconciliar "${fileName}": ${error.message}`);
+      return;
+    }
+
+    for (const location of locations) {
+      if (location.id === this.node.id || expectedIds.has(location.id)) continue;
+      try {
+        await this.rpcClient.request(location,
+          `/rpc/files?name=${encodeURIComponent(fileName)}&force=true`, { method: 'DELETE' });
+      } catch (error) {
+        this.logger.error(
+          `[replicação] Não foi possível remover a réplica excedente do nó ${location.id}: ${error.message}`);
+      }
+    }
   }
 
   async locate(fileName) {
     const name = validateFileName(fileName);
     const locations = [];
     const visited = new Set();
-    let current = this.node.reference;
+    const queue = [this.node.reference, this.node.predecessor, this.node.successor,
+      ...this.node.fingers.map((finger) => finger.node)].filter(Boolean);
 
-    while (current && !visited.has(current.id) && visited.size < MAX_HOPS) {
+    while (queue.length && visited.size < MAX_HOPS) {
+      const current = queue.shift();
+      if (!current || visited.has(current.id)) continue;
       visited.add(current.id);
       try {
         const check = current.id === this.node.id
@@ -72,20 +108,48 @@ class ReplicationService {
           : await this.rpcClient.request(current,
             `/rpc/replica-check?name=${encodeURIComponent(name)}`);
         if (check.exists) {
-          locations.push({ ...current, role: check.isReplica ? 'replica' : 'primary' });
+          locations.push({
+            ...current,
+            role: check.isReplica ? 'replica' : 'primary',
+            primaryNodeId: check.primaryNodeId,
+            storedAt: check.storedAt,
+            uploadedBy: check.uploadedBy || null,
+            uploadedAt: check.uploadedAt || null,
+            history: check.history || []
+          });
         }
       } catch (error) {
-        if (error.code !== 'ENOENT') throw error;
+        if (current.id === this.node.id && error.code !== 'ENOENT') throw error;
       }
 
-      if (current.id === this.node.id) {
-        current = this.node.successor;
-      } else {
-        const result = await this.rpcClient.request(current, '/rpc/successor');
-        current = result.node;
+      if (current.id !== this.node.id) {
+        try {
+          const state = await this.rpcClient.request(current, '/api/state');
+          queue.push(state.predecessor, state.successor,
+            ...state.fingerTable.map((finger) => finger.node));
+        } catch {
+          // Um nó offline não impede a busca pelas outras referências conhecidas.
+        }
       }
     }
-    return { name, hashId: hashKey(name), locations };
+
+    locations.sort((left, right) => left.id - right.id);
+
+    const primary = locations.find((location) => location.role === 'primary') || null;
+    const replicas = locations.filter((location) => location.role === 'replica');
+    const source = primary || locations[0] || {};
+    const events = mergeEvents(locations.flatMap((location) => location.history || []));
+    return {
+      name,
+      hashId: hashKey(name),
+      uploadedBy: source.uploadedBy || null,
+      uploadedAt: source.uploadedAt || null,
+      primary,
+      replicas,
+      replicaLimit: REPLICA_COUNT,
+      locations,
+      events
+    };
   }
 
   async verify() {
@@ -98,15 +162,24 @@ class ReplicationService {
       return;
     }
     for (const file of primaryFiles) {
-      let content;
       try {
-        content = await this.repository.read(file.name);
-      } catch {
-        continue;
+        const content = await this.repository.read(file.name);
+        await this.replicate(file.name, content, file.hashId);
+      } catch (error) {
+        this.logger.error(`[replicação] Falha ao verificar "${file.name}": ${error.message}`);
       }
-      await this.replicate(file.name, content, file.hashId);
     }
   }
+}
+
+function mergeEvents(events) {
+  const unique = new Map();
+  for (const event of events) {
+    const id = event.id || `${event.type}-${event.timestamp}-${event.node?.id || ''}`;
+    unique.set(id, { ...event, id });
+  }
+  return [...unique.values()].sort((left, right) =>
+    String(left.timestamp || '').localeCompare(String(right.timestamp || '')));
 }
 
 module.exports = { ReplicationService };
