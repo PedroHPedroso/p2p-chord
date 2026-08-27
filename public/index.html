@@ -132,6 +132,46 @@
       <div id="catalog-list" class="catalog-list" aria-live="polite">
         <p class="empty-row">Carregando catálogo…</p>
       </div>
+
+      <section id="file-trace" class="file-trace" aria-live="polite" hidden>
+        <div class="trace-heading">
+          <div>
+            <p class="eyebrow">Rastreamento</p>
+            <h3 id="trace-name">Arquivo</h3>
+            <p id="trace-hash" class="muted"></p>
+          </div>
+          <button id="trace-close" class="button secondary" type="button">Fechar</button>
+        </div>
+        <div class="trace-summary">
+          <article>
+            <span>Enviado por</span>
+            <strong id="trace-uploader">—</strong>
+            <small id="trace-uploaded-at">Origem não registrada</small>
+          </article>
+          <article>
+            <span>Primário atual</span>
+            <strong id="trace-primary">—</strong>
+            <small id="trace-primary-address">Nenhum primário online</small>
+          </article>
+          <article>
+            <span>Réplicas</span>
+            <strong id="trace-replica-count">0 / 2</strong>
+            <small>Somente os dois sucessores</small>
+          </article>
+        </div>
+        <div class="trace-columns">
+          <div>
+            <h4>Onde estão as cópias</h4>
+            <div id="trace-locations" class="trace-locations"></div>
+          </div>
+          <div>
+            <h4>Caminho completo do arquivo</h4>
+            <div id="trace-path" class="trace-path"></div>
+            <h4 class="events-title">Histórico de movimentações</h4>
+            <ol id="trace-events" class="trace-events"></ol>
+          </div>
+        </div>
+      </section>
     </section>
 
     <p id="global-error" class="global-error" role="alert" hidden></p>

@@ -28,7 +28,19 @@ const elements = {
   uploadFile: document.querySelector('#upload-file'),
   selectedFile: document.querySelector('#selected-file'),
   uploadButton: document.querySelector('#upload-button'),
-  uploadMessage: document.querySelector('#upload-message')
+  uploadMessage: document.querySelector('#upload-message'),
+  fileTrace: document.querySelector('#file-trace'),
+  traceClose: document.querySelector('#trace-close'),
+  traceName: document.querySelector('#trace-name'),
+  traceHash: document.querySelector('#trace-hash'),
+  traceUploader: document.querySelector('#trace-uploader'),
+  traceUploadedAt: document.querySelector('#trace-uploaded-at'),
+  tracePrimary: document.querySelector('#trace-primary'),
+  tracePrimaryAddress: document.querySelector('#trace-primary-address'),
+  traceReplicaCount: document.querySelector('#trace-replica-count'),
+  traceLocations: document.querySelector('#trace-locations'),
+  tracePath: document.querySelector('#trace-path'),
+  traceEvents: document.querySelector('#trace-events')
 };
 
 let refreshing = false;
@@ -90,8 +102,10 @@ function render(state) {
   elements.nodeTitle.textContent = state.node.id;
   elements.currentId.textContent = state.node.id;
   elements.nodeAddress.textContent = `http://${address(state.node)}`;
-  elements.joinedLabel.textContent = state.joined ? 'No anel' : 'Fora do anel';
-  elements.joinedLabel.classList.toggle('active', state.joined);
+  elements.joinedLabel.textContent = state.leaving
+    ? `Saindo (${state.leavePhase})`
+    : state.joined ? 'No anel' : 'Fora do anel';
+  elements.joinedLabel.classList.toggle('active', state.joined && !state.leaving);
   elements.joinPanel.hidden = state.joined;
   elements.filesPanel.hidden = !state.joined;
   renderNode(elements.predecessorId, elements.predecessorAddress, state.predecessor);
@@ -108,10 +122,8 @@ function renderCatalog(names) {
   }
 
   elements.catalogList.replaceChildren(...names.map((name) => {
-    const link = document.createElement('a');
-    link.className = 'catalog-file';
-    link.href = `/api/files?name=${encodeURIComponent(name)}`;
-    link.download = name;
+    const card = document.createElement('article');
+    card.className = 'catalog-file';
 
     const icon = document.createElement('span');
     icon.className = 'file-icon';
@@ -124,12 +136,167 @@ function renderCatalog(names) {
     locations.className = 'file-locations';
     locations.textContent = 'Consultando cópias…';
     details.append(label, locations);
-    const action = document.createElement('small');
-    action.textContent = 'Baixar';
-    link.append(icon, details, action);
+    const actions = document.createElement('span');
+    actions.className = 'catalog-file-actions';
+    const track = document.createElement('button');
+    track.type = 'button';
+    track.className = 'text-action';
+    track.textContent = 'Rastrear';
+    track.addEventListener('click', () => showFileTrace(name));
+    const download = document.createElement('a');
+    download.href = `/api/files?name=${encodeURIComponent(name)}`;
+    download.download = name;
+    download.textContent = 'Baixar';
+    actions.append(track, download);
+    card.append(icon, details, actions);
     fillFileLocations(name, locations);
-    return link;
+    return card;
   }));
+}
+
+async function showFileTrace(name) {
+  elements.fileTrace.hidden = false;
+  elements.traceName.textContent = name;
+  elements.traceHash.textContent = 'Consultando a rede…';
+  elements.traceLocations.innerHTML = '<p class="muted">Localizando cópias…</p>';
+  elements.tracePath.replaceChildren();
+  elements.traceEvents.replaceChildren();
+  elements.fileTrace.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+
+  try {
+    const response = await fetch(`/api/files/locations?name=${encodeURIComponent(name)}`, {
+      cache: 'no-store'
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `Falha HTTP ${response.status}`);
+    renderFileTrace(result);
+  } catch (error) {
+    elements.traceHash.textContent = error.message;
+    elements.traceLocations.innerHTML = '<p class="global-error">Não foi possível rastrear o arquivo.</p>';
+  }
+}
+
+function renderFileTrace(result) {
+  const uploader = result.uploadedBy;
+  elements.traceHash.textContent = `Hash Chord: ${result.hashId}`;
+  elements.traceUploader.textContent = uploader ? `Nó ${uploader.id}` : 'Não registrado';
+  elements.traceUploadedAt.textContent = result.uploadedAt
+    ? `em ${formatDate(result.uploadedAt)}`
+    : 'Arquivo importado de uma versão anterior';
+  elements.tracePrimary.textContent = result.primary ? `Nó ${result.primary.id}` : '—';
+  elements.tracePrimaryAddress.textContent = result.primary
+    ? address(result.primary)
+    : 'Nenhum primário online';
+  elements.traceReplicaCount.textContent = `${result.replicas.length} / ${result.replicaLimit}`;
+
+  if (!result.locations.length) {
+    elements.traceLocations.innerHTML = '<p class="muted">Nenhuma cópia online encontrada.</p>';
+  } else {
+    elements.traceLocations.replaceChildren(...result.locations.map((location) => {
+      const row = document.createElement('div');
+      row.className = `trace-location ${location.role}`;
+      const badge = document.createElement('span');
+      badge.className = 'node-badge';
+      badge.textContent = location.id;
+      const details = document.createElement('span');
+      const title = document.createElement('strong');
+      title.textContent = location.role === 'primary' ? 'Primário' : 'Réplica';
+      const nodeAddress = document.createElement('small');
+      nodeAddress.textContent = address(location);
+      details.append(title, nodeAddress);
+      row.append(badge, details);
+      return row;
+    }));
+  }
+
+  const events = result.events || [];
+  renderTracePath(events);
+  if (!events.length) {
+    const item = document.createElement('li');
+    item.textContent = 'Não há eventos registrados para este arquivo.';
+    elements.traceEvents.replaceChildren(item);
+    return;
+  }
+  elements.traceEvents.replaceChildren(...events.map((event) => {
+    const item = document.createElement('li');
+    const label = document.createElement('strong');
+    if (event.type === 'upload') {
+      label.textContent = `Nó ${event.node?.id ?? '?'} inseriu o arquivo`;
+    } else if (event.type === 'replica_created') {
+      label.textContent = `Réplica enviada do nó ${event.fromNode?.id ?? '?'} para o nó ${event.node?.id ?? '?'}`;
+    } else if (event.type === 'replica_removed') {
+      label.textContent = `Réplica removida do nó ${event.node?.id ?? '?'}`;
+    } else if (event.type === 'primary_transferred') {
+      label.textContent = `Primário transferido do nó ${event.fromNode?.id ?? '?'} para o nó ${event.node?.id ?? '?'}`;
+    } else {
+      label.textContent = 'Arquivo recuperado do armazenamento anterior';
+    }
+    const time = document.createElement('small');
+    time.textContent = event.timestamp && !event.timestamp.startsWith('1970-')
+      ? formatDate(event.timestamp)
+      : 'data não disponível';
+    item.append(label, time);
+    return item;
+  }));
+}
+
+function renderTracePath(events) {
+  if (!events.length) {
+    elements.tracePath.innerHTML = '<p class="muted">O caminho anterior não foi registrado.</p>';
+    return;
+  }
+
+  elements.tracePath.replaceChildren(...events.map((event, index) => {
+    const hop = document.createElement('div');
+    hop.className = `path-hop ${event.type}`;
+    const order = document.createElement('span');
+    order.className = 'path-order';
+    order.textContent = event.sequence || index + 1;
+    const movement = document.createElement('span');
+    movement.className = 'path-movement';
+    const origin = document.createElement('strong');
+    const destination = document.createElement('strong');
+    const arrow = document.createElement('i');
+    arrow.textContent = '→';
+    const description = document.createElement('small');
+
+    if (event.type === 'upload') {
+      origin.textContent = 'Entrada';
+      destination.textContent = nodeLabel(event.node);
+      description.textContent = 'Upload recebido e primário criado';
+    } else if (event.type === 'replica_created') {
+      origin.textContent = nodeLabel(event.fromNode);
+      destination.textContent = nodeLabel(event.node);
+      description.textContent = 'Réplica criada no sucessor';
+    } else if (event.type === 'primary_transferred') {
+      origin.textContent = nodeLabel(event.fromNode);
+      destination.textContent = nodeLabel(event.node);
+      description.textContent = 'Primário transferido durante a saída do nó';
+    } else if (event.type === 'replica_removed') {
+      origin.textContent = nodeLabel(event.fromNode);
+      destination.textContent = nodeLabel(event.node);
+      description.textContent = 'Cópia removida da rota atual de réplicas';
+      arrow.textContent = '×';
+    } else {
+      origin.textContent = 'Armazenamento anterior';
+      destination.textContent = nodeLabel(event.node);
+      description.textContent = 'Registro importado sem origem conhecida';
+    }
+    movement.append(origin, arrow, destination, description);
+    hop.append(order, movement);
+    return hop;
+  }));
+}
+
+function nodeLabel(node) {
+  if (!node?.id) return 'Nó desconhecido';
+  return node.host && node.port
+    ? `Nó ${node.id} (${address(node)})`
+    : `Nó ${node.id}`;
+}
+
+function formatDate(value) {
+  return new Date(value).toLocaleString('pt-BR');
 }
 
 async function fillFileLocations(name, target) {
@@ -154,14 +321,10 @@ async function refreshCatalog() {
   if (catalogRefreshing || elements.filesPanel.hidden) return;
   catalogRefreshing = true;
   try {
-    const response = await fetch('/api/files?name=catalogo.txt', { cache: 'no-store' });
-    if (response.status === 404) {
-      renderCatalog([]);
-      return;
-    }
-    if (!response.ok) throw new Error(`Falha HTTP ${response.status}`);
-    const names = (await response.text()).split(/\r?\n/).filter(Boolean);
-    renderCatalog(names);
+    const response = await fetch('/api/catalog', { cache: 'no-store' });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `Falha HTTP ${response.status}`);
+    renderCatalog(result.names || []);
   } catch (error) {
     elements.catalogList.innerHTML = `<p class="global-error">Não foi possível carregar o catálogo: ${escapeHtml(error.message)}</p>`;
   } finally {
@@ -246,6 +409,9 @@ elements.joinForm.addEventListener('submit', async (event) => {
 
 elements.refreshButton.addEventListener('click', refresh);
 elements.filesRefreshButton.addEventListener('click', refreshCatalog);
+elements.traceClose.addEventListener('click', () => {
+  elements.fileTrace.hidden = true;
+});
 elements.uploadFile.addEventListener('change', () => {
   elements.selectedFile.textContent = elements.uploadFile.files[0]?.name
     || 'Nenhum arquivo selecionado';
@@ -278,6 +444,7 @@ elements.uploadForm.addEventListener('submit', async (event) => {
     elements.uploadForm.reset();
     elements.selectedFile.textContent = 'Nenhum arquivo selecionado';
     await refreshCatalog();
+    await showFileTrace(result.name);
   } catch (error) {
     elements.uploadMessage.className = 'form-message error';
     elements.uploadMessage.textContent = error.message;

@@ -1,7 +1,7 @@
 {
-  "name": "chord-node",
+  "name": "p2p-chord",
   "version": "1.0.0",
-  "description": "Implementação didática do protocolo Chord para identificadores de 1 a 32",
+  "description": "Implementação didática do protocolo P2P Chord em Node.js com saída voluntária e controlada de nós",
   "main": "src/server.js",
   "type": "commonjs",
   "scripts": {

@@ -42,6 +42,8 @@ async function loadNodes() {
       card.className = 'node-card';
       const predecessor = state.predecessor?.id ?? '—';
       const successor = state.successor?.id ?? '—';
+      const leaveLabel = state.leaving ? `Saindo (${state.leavePhase})…` : 'Sair da rede';
+      const leaveDisabled = state.leaving ? 'disabled' : '';
       card.innerHTML = `
         <div class="node-card-id">${state.node.id}</div>
         <div>
@@ -52,7 +54,7 @@ async function loadNodes() {
         <div class="node-actions">
           <a class="button secondary" href="http://${nodeAddress(state.node)}">Abrir painel</a>
           <button class="button danger" type="button" data-leave-port="${state.node.port}"
-            data-leave-id="${state.node.id}">Sair da rede</button>
+            data-leave-id="${state.node.id}" ${leaveDisabled}>${leaveLabel}</button>
         </div>`;
       return card;
     }));
